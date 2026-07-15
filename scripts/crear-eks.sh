@@ -33,7 +33,7 @@ readonly CLUSTER_WAIT_ATTEMPTS="${CLUSTER_WAIT_ATTEMPTS:-120}"
 readonly NODEGROUP_WAIT_ATTEMPTS="${NODEGROUP_WAIT_ATTEMPTS:-120}"
 readonly ADDON_WAIT_ATTEMPTS="${ADDON_WAIT_ATTEMPTS:-60}"
 
-readonly SCRIPT_VERSION="2026-07-15-clean-v1"
+readonly SCRIPT_VERSION="2026-07-15-clean-v2"
 
 readonly ECR_REPOSITORIES=(
   "tienda-frontend"
@@ -150,22 +150,21 @@ describe_cluster_status() {
   local status
   local exit_code
 
-  error_file="$(make_temp_file)"
+  error_file="$(mktemp)"
+  TEMP_FILES+=("$error_file")
 
-  set +e
-  status="$(aws eks describe-cluster \
+  if status="$(aws eks describe-cluster \
     --region "$REGION" \
     --name "$CLUSTER_NAME" \
     --query 'cluster.status' \
     --output text \
     --no-cli-pager \
-    2>"$error_file")"
-  exit_code=$?
-  set -e
+    2>"$error_file")"; then
 
-  if [[ "$exit_code" -eq 0 ]]; then
     printf '%s\n' "$status"
     return 0
+  else
+    exit_code=$?
   fi
 
   if grep -q 'ResourceNotFoundException' "$error_file"; then
@@ -181,23 +180,22 @@ describe_nodegroup_status() {
   local status
   local exit_code
 
-  error_file="$(make_temp_file)"
+  error_file="$(mktemp)"
+  TEMP_FILES+=("$error_file")
 
-  set +e
-  status="$(aws eks describe-nodegroup \
+  if status="$(aws eks describe-nodegroup \
     --region "$REGION" \
     --cluster-name "$CLUSTER_NAME" \
     --nodegroup-name "$NODEGROUP_NAME" \
     --query 'nodegroup.status' \
     --output text \
     --no-cli-pager \
-    2>"$error_file")"
-  exit_code=$?
-  set -e
+    2>"$error_file")"; then
 
-  if [[ "$exit_code" -eq 0 ]]; then
     printf '%s\n' "$status"
     return 0
+  else
+    exit_code=$?
   fi
 
   if grep -q 'ResourceNotFoundException' "$error_file"; then
@@ -214,23 +212,22 @@ describe_addon_status() {
   local status
   local exit_code
 
-  error_file="$(make_temp_file)"
+  error_file="$(mktemp)"
+  TEMP_FILES+=("$error_file")
 
-  set +e
-  status="$(aws eks describe-addon \
+  if status="$(aws eks describe-addon \
     --region "$REGION" \
     --cluster-name "$CLUSTER_NAME" \
     --addon-name "$addon_name" \
     --query 'addon.status' \
     --output text \
     --no-cli-pager \
-    2>"$error_file")"
-  exit_code=$?
-  set -e
+    2>"$error_file")"; then
 
-  if [[ "$exit_code" -eq 0 ]]; then
     printf '%s\n' "$status"
     return 0
+  else
+    exit_code=$?
   fi
 
   if grep -q 'ResourceNotFoundException' "$error_file"; then
@@ -244,6 +241,8 @@ describe_addon_status() {
 #######################################
 # ESPERAS
 #######################################
+# ESPERAS
+#######################################
 
 wait_for_cluster_active() {
   local attempt
@@ -253,10 +252,11 @@ wait_for_cluster_active() {
   log_info "Esperando que el clúster quede ACTIVE..."
 
   for ((attempt = 1; attempt <= CLUSTER_WAIT_ATTEMPTS; attempt++)); do
-    set +e
-    status="$(describe_cluster_status)"
-    exit_code=$?
-    set -e
+    if status="$(describe_cluster_status)"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
 
     case "$exit_code" in
       0)
@@ -304,10 +304,11 @@ wait_for_nodegroup_active() {
   log_info "Esperando que el Node Group quede ACTIVE..."
 
   for ((attempt = 1; attempt <= NODEGROUP_WAIT_ATTEMPTS; attempt++)); do
-    set +e
-    status="$(describe_nodegroup_status)"
-    exit_code=$?
-    set -e
+    if status="$(describe_nodegroup_status)"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
 
     case "$exit_code" in
       0)
@@ -355,10 +356,11 @@ wait_for_addon_active() {
   local exit_code
 
   for ((attempt = 1; attempt <= ADDON_WAIT_ATTEMPTS; attempt++)); do
-    set +e
-    status="$(describe_addon_status "$addon_name")"
-    exit_code=$?
-    set -e
+    if status="$(describe_addon_status "$addon_name")"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
 
     case "$exit_code" in
       0)
@@ -621,16 +623,19 @@ ensure_ecr_repository() {
   local error_file
   local exit_code
 
-  error_file="$(make_temp_file)"
+  error_file="$(mktemp)"
+  TEMP_FILES+=("$error_file")
 
-  set +e
-  aws ecr describe-repositories \
+  if aws ecr describe-repositories \
     --region "$REGION" \
     --repository-names "$repository" \
     --no-cli-pager \
-    >/dev/null 2>"$error_file"
-  exit_code=$?
-  set -e
+    >/dev/null 2>"$error_file"; then
+
+    exit_code=0
+  else
+    exit_code=$?
+  fi
 
   if [[ "$exit_code" -eq 0 ]]; then
     log_ok "Repositorio existente: $repository"
@@ -667,10 +672,11 @@ ensure_cluster() {
   local status
   local exit_code
 
-  set +e
-  status="$(describe_cluster_status)"
-  exit_code=$?
-  set -e
+  if status="$(describe_cluster_status)"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
 
   case "$exit_code" in
     0)
@@ -711,10 +717,11 @@ ensure_nodegroup() {
   local status
   local exit_code
 
-  set +e
-  status="$(describe_nodegroup_status)"
-  exit_code=$?
-  set -e
+  if status="$(describe_nodegroup_status)"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
 
   case "$exit_code" in
     0)
@@ -758,10 +765,11 @@ ensure_addon() {
   local status
   local exit_code
 
-  set +e
-  status="$(describe_addon_status "$addon_name")"
-  exit_code=$?
-  set -e
+  if status="$(describe_addon_status "$addon_name")"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
 
   case "$exit_code" in
     0)
