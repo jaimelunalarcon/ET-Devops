@@ -37,6 +37,12 @@ on:
         default: 3
         type: number
 
+      cloudwatch_enabled:
+        description: "Instalar CloudWatch Observability"
+        required: true
+        default: true
+        type: boolean
+
 permissions:
   contents: read
 
@@ -52,16 +58,41 @@ env:
 
 jobs:
   deploy-eks:
-    name: Crear ECR y EKS
+    name: Crear ECR, EKS y CloudWatch
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
+      #####################################
+      # 1. CHECKOUT
+      #####################################
       - name: Descargar repositorio
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
+      #####################################
+      # 2. DIAGNÓSTICO DEL COMMIT
+      #####################################
+      - name: Mostrar commit ejecutado
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "CÓDIGO EJECUTADO POR GITHUB ACTIONS"
+          echo "========================================"
+          echo "Branch:     $GITHUB_REF_NAME"
+          echo "SHA:        $GITHUB_SHA"
+          echo "Repositorio: $GITHUB_REPOSITORY"
+          echo ""
+
+          git log -1 --oneline
+
+      #####################################
+      # 3. CONFIGURAR AWS
+      #####################################
       - name: Configurar credenciales AWS Academy
-        uses: aws-actions/configure-aws-credentials@v6.1.0
+        uses: aws-actions/configure-aws-credentials@v6.2.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -70,6 +101,9 @@ jobs:
           allowed-account-ids: "429001817066"
           mask-aws-account-id: true
 
+      #####################################
+      # 4. VALIDAR IDENTIDAD
+      #####################################
       - name: Validar identidad AWS
         run: |
           set -euo pipefail
@@ -79,61 +113,247 @@ jobs:
             --output table \
             --no-cli-pager
 
+      #####################################
+      # 5. INSTALAR KUBECTL
+      #####################################
+      - name: Instalar kubectl
+        run: |
+          set -euo pipefail
+
+          KUBECTL_VERSION="v1.35.0"
+
+          curl -fsSLo kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+          kubectl version --client
+
+      #####################################
+      # 6. VALIDAR RED
+      #####################################
       - name: Validar existencia de la red
         run: |
           set -euo pipefail
 
           VPC_ID=$(aws ec2 describe-vpcs \
             --region "$AWS_REGION" \
-            --filters "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-vpc" \
+            --filters \
+              "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-vpc" \
             --query "Vpcs[0].VpcId" \
             --output text \
             --no-cli-pager)
 
           if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
             echo "::error::No se encontró ${NETWORK_PROJECT_NAME}-vpc."
-            echo "::error::Ejecuta primero el workflow de infraestructura de red."
+            echo "::error::Ejecuta primero el workflow Deploy Red AWS."
             exit 1
           fi
 
           echo "VPC encontrada: $VPC_ID"
 
-      - name: Validar script crear-eks.sh
+          APP_SUBNET_A=$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-app-a" \
+            --query "Subnets[0].SubnetId" \
+            --output text \
+            --no-cli-pager)
+
+          APP_SUBNET_B=$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-app-b" \
+            --query "Subnets[0].SubnetId" \
+            --output text \
+            --no-cli-pager)
+
+          if [ -z "$APP_SUBNET_A" ] || [ "$APP_SUBNET_A" = "None" ]; then
+            echo "::error::No se encontró ${NETWORK_PROJECT_NAME}-app-a."
+            exit 1
+          fi
+
+          if [ -z "$APP_SUBNET_B" ] || [ "$APP_SUBNET_B" = "None" ]; then
+            echo "::error::No se encontró ${NETWORK_PROJECT_NAME}-app-b."
+            exit 1
+          fi
+
+          echo "Subred APP A: $APP_SUBNET_A"
+          echo "Subred APP B: $APP_SUBNET_B"
+
+      #####################################
+      # 7. VALIDAR SCRIPT
+      #####################################
+      - name: Validar crear-eks.sh
         run: |
           set -euo pipefail
 
-          test -f scripts/crear-eks.sh
-          bash -n scripts/crear-eks.sh
+          if [ ! -f scripts/crear-eks.sh ]; then
+            echo "::error::No existe scripts/crear-eks.sh."
+            exit 1
+          fi
+
           chmod +x scripts/crear-eks.sh
 
-      - name: Crear repositorios ECR, clúster EKS y Node Group
+          echo "Validando sintaxis Bash..."
+          bash -n scripts/crear-eks.sh
+
+          echo "Sintaxis Bash válida."
+
+      #####################################
+      # 8. DIAGNÓSTICO DE WAITERS
+      #####################################
+      - name: Revisar funciones de espera
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "WAITERS Y FUNCIONES DE ESPERA"
+          echo "========================================"
+
+          echo ""
+          echo "Función wait_for_cluster_active:"
+          grep -n "wait_for_cluster_active" scripts/crear-eks.sh || true
+
+          echo ""
+          echo "Referencias antiguas:"
+          grep -n "wait_for_cluster_visibility" scripts/crear-eks.sh || true
+
+          echo ""
+          echo "Waiters oficiales encontrados:"
+          grep -nE "aws eks wait|cluster-active" scripts/crear-eks.sh || true
+
+          if grep -q "wait_for_cluster_visibility" scripts/crear-eks.sh; then
+            echo "::error::El script todavía contiene wait_for_cluster_visibility."
+            exit 1
+          fi
+
+          if grep -q "aws eks wait cluster-active" scripts/crear-eks.sh; then
+            echo "::error::El script todavía contiene aws eks wait cluster-active."
+            exit 1
+          fi
+
+          if ! grep -q "^wait_for_cluster_active()" scripts/crear-eks.sh; then
+            echo "::error::No se encontró la función wait_for_cluster_active."
+            exit 1
+          fi
+
+          echo ""
+          echo "Validación de esperas completada."
+
+      #####################################
+      # 9. EJECUTAR SCRIPT
+      #####################################
+      - name: Crear ECR, clúster EKS, Node Group y CloudWatch
         env:
           KUBERNETES_VERSION: ${{ inputs.kubernetes_version }}
           NODE_INSTANCE_TYPE: ${{ inputs.node_instance_type }}
           NODE_MIN_SIZE: ${{ inputs.node_min_size }}
           NODE_DESIRED_SIZE: ${{ inputs.node_desired_size }}
           NODE_MAX_SIZE: ${{ inputs.node_max_size }}
+          CLOUDWATCH_ENABLED: ${{ inputs.cloudwatch_enabled }}
         run: |
           set -euo pipefail
+
+          echo "Ejecutando scripts/crear-eks.sh..."
           ./scripts/crear-eks.sh
 
-      - name: Verificar clúster EKS
+      #####################################
+      # 10. CONFIGURAR KUBECONFIG
+      #####################################
+      - name: Configurar acceso al clúster
         run: |
           set -euo pipefail
 
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$CLUSTER_NAME" \
-            --alias "$CLUSTER_NAME"
+            --alias "$CLUSTER_NAME" \
+            --no-cli-pager
 
+          kubectl config current-context
+
+      #####################################
+      # 11. VERIFICAR EKS
+      #####################################
+      - name: Verificar clúster EKS
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "NODOS"
+          echo "========================================"
           kubectl get nodes -o wide
-          kubectl get pods --all-namespaces
 
+          echo ""
+          echo "========================================"
+          echo "PODS DEL CLÚSTER"
+          echo "========================================"
+          kubectl get pods --all-namespaces -o wide
+
+          echo ""
+          echo "========================================"
+          echo "ADD-ONS EKS"
+          echo "========================================"
+          aws eks list-addons \
+            --region "$AWS_REGION" \
+            --cluster-name "$CLUSTER_NAME" \
+            --output table \
+            --no-cli-pager
+
+      #####################################
+      # 12. VERIFICAR CLOUDWATCH
+      #####################################
+      - name: Verificar CloudWatch Observability
+        if: ${{ inputs.cloudwatch_enabled }}
+        run: |
+          set -euo pipefail
+
+          CLOUDWATCH_STATUS=$(aws eks describe-addon \
+            --region "$AWS_REGION" \
+            --cluster-name "$CLUSTER_NAME" \
+            --addon-name amazon-cloudwatch-observability \
+            --query "addon.status" \
+            --output text \
+            --no-cli-pager)
+
+          POD_IDENTITY_STATUS=$(aws eks describe-addon \
+            --region "$AWS_REGION" \
+            --cluster-name "$CLUSTER_NAME" \
+            --addon-name eks-pod-identity-agent \
+            --query "addon.status" \
+            --output text \
+            --no-cli-pager)
+
+          echo "CloudWatch Observability: $CLOUDWATCH_STATUS"
+          echo "EKS Pod Identity Agent:  $POD_IDENTITY_STATUS"
+
+          if [ "$CLOUDWATCH_STATUS" != "ACTIVE" ]; then
+            echo "::error::CloudWatch Observability no está ACTIVE."
+            exit 1
+          fi
+
+          if [ "$POD_IDENTITY_STATUS" != "ACTIVE" ]; then
+            echo "::error::EKS Pod Identity Agent no está ACTIVE."
+            exit 1
+          fi
+
+          echo ""
+          kubectl get pods \
+            --namespace amazon-cloudwatch \
+            -o wide
+
+      #####################################
+      # 13. RESUMEN
+      #####################################
       - name: Publicar resumen
         if: success()
         run: |
           {
-            echo "## Infraestructura EKS desplegada"
+            echo "## Infraestructura Amazon EKS desplegada"
             echo ""
             echo "| Recurso | Valor |"
             echo "|---|---|"
@@ -143,11 +363,19 @@ jobs:
             echo "| Kubernetes | \`${{ inputs.kubernetes_version }}\` |"
             echo "| Instancia | \`${{ inputs.node_instance_type }}\` |"
             echo "| Escalamiento | \`${{ inputs.node_min_size }}/${{ inputs.node_desired_size }}/${{ inputs.node_max_size }}\` |"
+            echo "| CloudWatch | \`${{ inputs.cloudwatch_enabled }}\` |"
             echo ""
             echo "### Repositorios ECR"
             echo ""
             echo "- \`tienda-frontend\`"
             echo "- \`tienda-backend\`"
             echo "- \`tienda-db\`"
+            echo ""
+            echo "### Verificaciones"
+            echo ""
+            echo "- Clúster EKS activo"
+            echo "- Managed Node Group activo"
+            echo "- Nodos Kubernetes disponibles"
+            echo "- Kubeconfig configurado"
+            echo "- Add-ons verificados"
           } >> "$GITHUB_STEP_SUMMARY"
-
