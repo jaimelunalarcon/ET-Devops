@@ -731,7 +731,11 @@ ensure_cluster() {
 
     log_info "Creando clúster $CLUSTER_NAME..."
 
-    aws eks create-cluster \
+    local create_response create_name create_status request_token
+    request_token="${CLUSTER_NAME}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}"
+    request_token="${request_token:0:64}"
+
+    create_response=$(aws eks create-cluster \
       --region "$REGION" \
       --name "$CLUSTER_NAME" \
       --version "$KUBERNETES_VERSION" \
@@ -745,11 +749,19 @@ ensure_cluster() {
         "Project=$PROJECT_NAME" \
         "Environment=$ENVIRONMENT" \
         'ManagedBy=crear-eks.sh' \
-      --client-request-token "${CLUSTER_NAME}-create-v1" \
-      --no-cli-pager \
-      >/dev/null
+      --client-request-token "$request_token" \
+      --output json \
+      --no-cli-pager)
 
-    log_ok "AWS aceptó la solicitud create-cluster."
+    create_name=$(printf '%s' "$create_response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cluster",{}).get("name",""))')
+    create_status=$(printf '%s' "$create_response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cluster",{}).get("status",""))')
+
+    if resource_not_found "$create_name" || [[ "$create_name" != "$CLUSTER_NAME" ]]; then
+      printf '%s\n' "$create_response" >&2
+      fail "create-cluster no devolvió un clúster válido llamado $CLUSTER_NAME."
+    fi
+
+    log_ok "AWS registró create-cluster. Estado inicial: ${create_status:-desconocido}."
     wait_for_cluster_active
     status="ACTIVE"
   fi
@@ -842,7 +854,7 @@ ensure_nodegroup() {
         "Project=$PROJECT_NAME" \
         "Environment=$ENVIRONMENT" \
         'ManagedBy=crear-eks.sh' \
-      --client-request-token "${CLUSTER_NAME}-${NODEGROUP_NAME}-create-v1" \
+      --client-request-token "${CLUSTER_NAME}-${NODEGROUP_NAME}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}" \
       --no-cli-pager \
       >/dev/null
 
@@ -897,7 +909,7 @@ ensure_addon() {
     --cluster-name "$CLUSTER_NAME" \
     --addon-name "$addon_name" \
     --resolve-conflicts OVERWRITE \
-    --client-request-token "${CLUSTER_NAME}-${addon_name}-create-v1" \
+    --client-request-token "${CLUSTER_NAME}-${addon_name}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}" \
     --no-cli-pager \
     >/dev/null
 
