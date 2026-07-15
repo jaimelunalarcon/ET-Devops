@@ -314,10 +314,10 @@ wait_for_cluster_active() {
     else
       rc=$?
       if [[ "$rc" -eq 4 ]]; then
-        if [[ "$attempt" -le 3 ]]; then
-          log_info "El clúster aún no es visible (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
-        else
-          fail "AWS aceptó create-cluster, pero describe-cluster continúa devolviendo ResourceNotFoundException. La creación no quedó registrada en la región ${REGION}."
+        log_info "El clúster aún no es visible (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
+
+        if (( attempt == 12 )); then
+          log_warn "El clúster continúa sin aparecer después de $((attempt * POLL_INTERVAL_SECONDS)) segundos. Se mantendrá el polling hasta agotar el tiempo configurado."
         fi
       else
         return "$rc"
@@ -360,11 +360,7 @@ wait_for_nodegroup_active() {
     else
       rc=$?
       if [[ "$rc" -eq 4 ]]; then
-        if [[ "$attempt" -le 3 ]]; then
-          log_info "El Node Group aún no es visible (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
-        else
-          fail "El Node Group sigue sin existir después de la solicitud de creación."
-        fi
+        log_info "El Node Group aún no es visible (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
       else
         return "$rc"
       fi
@@ -404,11 +400,7 @@ wait_for_addon_active() {
     else
       rc=$?
       if [[ "$rc" -eq 4 ]]; then
-        if [[ "$attempt" -le 3 ]]; then
-          log_info "El add-on '$addon_name' aún no es visible (${attempt}/${ADDON_WAIT_ATTEMPTS})."
-        else
-          fail "El add-on '$addon_name' sigue sin existir después de la solicitud de creación."
-        fi
+        log_info "El add-on '$addon_name' aún no es visible (${attempt}/${ADDON_WAIT_ATTEMPTS})."
       else
         return "$rc"
       fi
@@ -665,7 +657,7 @@ resolve_role_arn() {
     --output text \
     --no-cli-pager)
 
-  resource_not_found "$role_arn" &&
+  is_empty_aws_value "$role_arn" &&
     fail "No fue posible resolver el ARN del rol IAM que contiene '$role_pattern'."
 
   printf '%s\n' "$role_arn"
@@ -739,10 +731,19 @@ ensure_cluster() {
 
     log_info "Creando clúster $CLUSTER_NAME..."
 
+    local create_response_file request_token
+    create_response_file=$(make_temp_file)
+    request_token="${CLUSTER_NAME}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}"
+    request_token="${request_token:0:64}"
+
+    # El código de salida de AWS CLI es la validación primaria. La respuesta se
+    # conserva para diagnóstico, pero no se procesa con Python porque algunos
+    # entornos de AWS Academy pueden devolver stdout vacío aun cuando el comando
+    # fue aceptado.
     aws eks create-cluster \
       --region "$REGION" \
       --name "$CLUSTER_NAME" \
-      --version "$KUBERNETES_VERSION" \
+      --kubernetes-version "$KUBERNETES_VERSION" \
       --role-arn "$cluster_role_arn" \
       --resources-vpc-config \
         "subnetIds=${subnet_a},${subnet_b},endpointPublicAccess=true,endpointPrivateAccess=true" \
@@ -750,14 +751,19 @@ ensure_cluster() {
       --logging \
         '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
       --tags \
-        "Project=$PROJECT_NAME" \
-        "Environment=$ENVIRONMENT" \
-        'ManagedBy=crear-eks.sh' \
-      --client-request-token "${CLUSTER_NAME}-create-v1" \
+        "Project=$PROJECT_NAME,Environment=$ENVIRONMENT,ManagedBy=crear-eks.sh" \
+      --client-request-token "$request_token" \
+      --output json \
       --no-cli-pager \
-      >/dev/null
+      >"$create_response_file"
 
-    log_ok "AWS aceptó la solicitud create-cluster."
+    if [[ -s "$create_response_file" ]]; then
+      log_ok "AWS CLI aceptó create-cluster y devolvió una respuesta."
+    else
+      log_warn "AWS CLI aceptó create-cluster, pero no devolvió contenido por stdout. Se verificará mediante describe-cluster."
+    fi
+
+    rm -f "$create_response_file"
     wait_for_cluster_active
     status="ACTIVE"
   fi
@@ -847,10 +853,8 @@ ensure_nodegroup() {
       --labels \
         "workload=$PROJECT_NAME,environment=$ENVIRONMENT" \
       --tags \
-        "Project=$PROJECT_NAME" \
-        "Environment=$ENVIRONMENT" \
-        'ManagedBy=crear-eks.sh' \
-      --client-request-token "${CLUSTER_NAME}-${NODEGROUP_NAME}-create-v1" \
+        "Project=$PROJECT_NAME,Environment=$ENVIRONMENT,ManagedBy=crear-eks.sh" \
+      --client-request-token "${CLUSTER_NAME}-${NODEGROUP_NAME}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}" \
       --no-cli-pager \
       >/dev/null
 
@@ -905,7 +909,7 @@ ensure_addon() {
     --cluster-name "$CLUSTER_NAME" \
     --addon-name "$addon_name" \
     --resolve-conflicts OVERWRITE \
-    --client-request-token "${CLUSTER_NAME}-${addon_name}-create-v1" \
+    --client-request-token "${CLUSTER_NAME}-${addon_name}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}" \
     --no-cli-pager \
     >/dev/null
 
@@ -971,9 +975,7 @@ ensure_cloudwatch_observability() {
       --service-account cloudwatch-agent \
       --role-arn "$cloudwatch_role_arn" \
       --tags \
-        "Project=$PROJECT_NAME" \
-        "Environment=$ENVIRONMENT" \
-        'ManagedBy=crear-eks.sh' \
+        "Project=$PROJECT_NAME,Environment=$ENVIRONMENT,ManagedBy=crear-eks.sh" \
       --query 'association.associationId' \
       --output text \
       --no-cli-pager)
