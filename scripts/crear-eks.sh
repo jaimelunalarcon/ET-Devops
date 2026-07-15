@@ -561,7 +561,7 @@ if resource_not_found "$CLUSTER_STATUS"; then
 
   echo "Solicitud de creación enviada."
 
-  wait_for_cluster_visibility
+  wait_for_cluster_active
   CLUSTER_STATUS=$(get_cluster_status)
 else
   echo "El clúster ya existe."
