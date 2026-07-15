@@ -117,52 +117,52 @@ get_addon_status() {
     2>/dev/null || true
 }
 
-wait_for_cluster_visibility() {
-  local attempts=30
+wait_for_cluster_active() {
+  local attempts=90
   local current_attempt=1
   local status
 
-  echo "Esperando que el clúster sea visible en la API de EKS..."
+  echo "Esperando que el clúster $CLUSTER_NAME quede ACTIVE..."
 
   while [ "$current_attempt" -le "$attempts" ]; do
     status=$(get_cluster_status)
 
-    if ! resource_not_found "$status"; then
-      echo "Clúster visible. Estado actual: $status"
-      return 0
-    fi
+    case "$status" in
+      ACTIVE)
+        echo "Clúster activo."
+        return 0
+        ;;
 
-    echo "Clúster todavía no visible. Reintento ${current_attempt}/${attempts}..."
+      CREATING | UPDATING)
+        echo "Estado del clúster: $status. Reintento ${current_attempt}/${attempts}..."
+        ;;
+
+      FAILED)
+        fail "El clúster quedó en estado FAILED."
+        ;;
+
+      DELETING)
+        fail "El clúster está siendo eliminado."
+        ;;
+
+      "")
+        echo "El clúster todavía no es visible. Reintento ${current_attempt}/${attempts}..."
+        ;;
+
+      None | null)
+        echo "El clúster todavía no es visible. Reintento ${current_attempt}/${attempts}..."
+        ;;
+
+      *)
+        echo "Estado temporal o desconocido: $status. Reintento ${current_attempt}/${attempts}..."
+        ;;
+    esac
+
     sleep 10
-
     current_attempt=$((current_attempt + 1))
   done
 
-  fail "EKS aceptó la creación, pero el clúster no apareció en la API."
-}
-
-wait_for_nodegroup_visibility() {
-  local attempts=30
-  local current_attempt=1
-  local status
-
-  echo "Esperando que el Node Group sea visible en la API de EKS..."
-
-  while [ "$current_attempt" -le "$attempts" ]; do
-    status=$(get_nodegroup_status)
-
-    if ! resource_not_found "$status"; then
-      echo "Node Group visible. Estado actual: $status"
-      return 0
-    fi
-
-    echo "Node Group todavía no visible. Reintento ${current_attempt}/${attempts}..."
-    sleep 10
-
-    current_attempt=$((current_attempt + 1))
-  done
-
-  fail "EKS aceptó la creación, pero el Node Group no apareció en la API."
+  fail "El clúster no quedó ACTIVE después de 15 minutos."
 }
 
 wait_for_addon() {
