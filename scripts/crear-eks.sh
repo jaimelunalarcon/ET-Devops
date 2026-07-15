@@ -644,10 +644,14 @@ resolve_role_arn() {
   if role_arn=$(get_role_arn "$role_name"); then
     printf '%s\n' "$role_arn"
     return 0
+  else
+    rc=$?
   fi
 
-  rc=$?
-  [[ "$rc" -eq 4 ]] && fail "No se encontró el rol IAM '$role_name' proporcionado por AWS Academy."
+  if [[ "$rc" -eq 4 ]]; then
+    fail "No se encontró el rol IAM '$role_name' proporcionado por AWS Academy."
+  fi
+
   return "$rc"
 }
 
@@ -656,6 +660,9 @@ validate_role_trust() {
   local expected_service="$2"
   local role_name trust_count
   role_name="${role_arn##*/}"
+
+  [[ -n "$role_arn" ]] || fail "Se recibió un ARN IAM vacío al validar la confianza del rol."
+  [[ -n "$role_name" ]] || fail "No fue posible extraer el nombre del rol desde el ARN: '$role_arn'."
 
   trust_count=$(aws iam get-role \
     --role-name "$role_name" \
@@ -677,9 +684,10 @@ ensure_ecr_repositories() {
     if repository_exists "$repository"; then
       log_ok "Repositorio existente: $repository"
       continue
+    else
+      rc=$?
     fi
 
-    rc=$?
     [[ "$rc" -eq 4 ]] || return "$rc"
 
     aws ecr create-repository \
@@ -869,9 +877,10 @@ ensure_addon() {
         ;;
       *) fail "Estado inesperado del add-on '$addon_name': $status" ;;
     esac
+  else
+    rc=$?
   fi
 
-  rc=$?
   [[ "$rc" -eq 4 ]] || return "$rc"
 
   log_info "Instalando add-on: $addon_name"
@@ -898,9 +907,10 @@ resolve_cloudwatch_role_arn() {
   if role_arn=$(get_role_arn "$CLOUDWATCH_ROLE_NAME"); then
     printf '%s\n' "$role_arn"
     return 0
+  else
+    rc=$?
   fi
 
-  rc=$?
   [[ "$rc" -eq 4 ]] && return 4
   return "$rc"
 }
