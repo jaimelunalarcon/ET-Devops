@@ -1,0 +1,153 @@
+name: Infra - Amazon EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kubernetes_version:
+        description: "Versión de Kubernetes para Amazon EKS"
+        required: true
+        default: "1.35"
+        type: string
+
+      node_instance_type:
+        description: "Tipo de instancia para los nodos"
+        required: true
+        default: "t3.medium"
+        type: choice
+        options:
+          - t3.small
+          - t3.medium
+          - t3.large
+
+      node_min_size:
+        description: "Cantidad mínima de nodos"
+        required: true
+        default: 2
+        type: number
+
+      node_desired_size:
+        description: "Cantidad deseada de nodos"
+        required: true
+        default: 2
+        type: number
+
+      node_max_size:
+        description: "Cantidad máxima de nodos"
+        required: true
+        default: 3
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-cluster
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: tienda-eks
+  NODEGROUP_NAME: tienda-nodegroup
+  NETWORK_PROJECT_NAME: red-lab
+
+jobs:
+  deploy-eks:
+    name: Crear ECR y EKS
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS Academy
+        uses: aws-actions/configure-aws-credentials@v6.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "429001817066"
+          mask-aws-account-id: true
+
+      - name: Validar identidad AWS
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity \
+            --query '{Cuenta:Account,Arn:Arn}' \
+            --output table \
+            --no-cli-pager
+
+      - name: Validar existencia de la red
+        run: |
+          set -euo pipefail
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text \
+            --no-cli-pager)
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "::error::No se encontró ${NETWORK_PROJECT_NAME}-vpc."
+            echo "::error::Ejecuta primero el workflow de infraestructura de red."
+            exit 1
+          fi
+
+          echo "VPC encontrada: $VPC_ID"
+
+      - name: Validar script crear-eks.sh
+        run: |
+          set -euo pipefail
+
+          test -f scripts/crear-eks.sh
+          bash -n scripts/crear-eks.sh
+          chmod +x scripts/crear-eks.sh
+
+      - name: Crear repositorios ECR, clúster EKS y Node Group
+        env:
+          KUBERNETES_VERSION: ${{ inputs.kubernetes_version }}
+          NODE_INSTANCE_TYPE: ${{ inputs.node_instance_type }}
+          NODE_MIN_SIZE: ${{ inputs.node_min_size }}
+          NODE_DESIRED_SIZE: ${{ inputs.node_desired_size }}
+          NODE_MAX_SIZE: ${{ inputs.node_max_size }}
+        run: |
+          set -euo pipefail
+          ./scripts/crear-eks.sh
+
+      - name: Verificar clúster EKS
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$CLUSTER_NAME" \
+            --alias "$CLUSTER_NAME"
+
+          kubectl get nodes -o wide
+          kubectl get pods --all-namespaces
+
+      - name: Publicar resumen
+        if: success()
+        run: |
+          {
+            echo "## Infraestructura EKS desplegada"
+            echo ""
+            echo "| Recurso | Valor |"
+            echo "|---|---|"
+            echo "| Región | \`${AWS_REGION}\` |"
+            echo "| Clúster | \`${CLUSTER_NAME}\` |"
+            echo "| Node Group | \`${NODEGROUP_NAME}\` |"
+            echo "| Kubernetes | \`${{ inputs.kubernetes_version }}\` |"
+            echo "| Instancia | \`${{ inputs.node_instance_type }}\` |"
+            echo "| Escalamiento | \`${{ inputs.node_min_size }}/${{ inputs.node_desired_size }}/${{ inputs.node_max_size }}\` |"
+            echo ""
+            echo "### Repositorios ECR"
+            echo ""
+            echo "- \`tienda-frontend\`"
+            echo "- \`tienda-backend\`"
+            echo "- \`tienda-db\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
