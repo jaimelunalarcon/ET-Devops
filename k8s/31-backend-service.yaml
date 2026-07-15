@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: tienda
+  labels:
+    app.kubernetes.io/name: tienda-backend
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: tienda-perritos
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app: tienda-backend
+
+  ports:
+    - name: http
+      protocol: TCP
+      port: 3001
+      targetPort: http

@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tienda-frontend
+  namespace: tienda
+  labels:
+    app.kubernetes.io/name: tienda-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: tienda-perritos
+
+spec:
+  replicas: 2
+
+  revisionHistoryLimit: 5
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  selector:
+    matchLabels:
+      app: tienda-frontend
+
+  template:
+    metadata:
+      labels:
+        app: tienda-frontend
+        app.kubernetes.io/name: tienda-frontend
+        app.kubernetes.io/component: frontend
+        app.kubernetes.io/part-of: tienda-perritos
+
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: tienda-frontend
+          image: 429001817066.dkr.ecr.us-east-1.amazonaws.com/tienda-frontend:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
