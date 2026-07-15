@@ -657,7 +657,7 @@ resolve_role_arn() {
     --output text \
     --no-cli-pager)
 
-  resource_not_found "$role_arn" &&
+  is_empty_aws_value "$role_arn" &&
     fail "No fue posible resolver el ARN del rol IAM que contiene '$role_pattern'."
 
   printf '%s\n' "$role_arn"
@@ -731,11 +731,16 @@ ensure_cluster() {
 
     log_info "Creando clúster $CLUSTER_NAME..."
 
-    local create_response create_name create_status request_token
+    local create_response_file request_token
+    create_response_file=$(make_temp_file)
     request_token="${CLUSTER_NAME}-${GITHUB_RUN_ID:-$(date +%s)}-${GITHUB_RUN_ATTEMPT:-1}"
     request_token="${request_token:0:64}"
 
-    create_response=$(aws eks create-cluster \
+    # El código de salida de AWS CLI es la validación primaria. La respuesta se
+    # conserva para diagnóstico, pero no se procesa con Python porque algunos
+    # entornos de AWS Academy pueden devolver stdout vacío aun cuando el comando
+    # fue aceptado.
+    aws eks create-cluster \
       --region "$REGION" \
       --name "$CLUSTER_NAME" \
       --version "$KUBERNETES_VERSION" \
@@ -751,17 +756,16 @@ ensure_cluster() {
         'ManagedBy=crear-eks.sh' \
       --client-request-token "$request_token" \
       --output json \
-      --no-cli-pager)
+      --no-cli-pager \
+      >"$create_response_file"
 
-    create_name=$(printf '%s' "$create_response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cluster",{}).get("name",""))')
-    create_status=$(printf '%s' "$create_response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cluster",{}).get("status",""))')
-
-    if resource_not_found "$create_name" || [[ "$create_name" != "$CLUSTER_NAME" ]]; then
-      printf '%s\n' "$create_response" >&2
-      fail "create-cluster no devolvió un clúster válido llamado $CLUSTER_NAME."
+    if [[ -s "$create_response_file" ]]; then
+      log_ok "AWS CLI aceptó create-cluster y devolvió una respuesta."
+    else
+      log_warn "AWS CLI aceptó create-cluster, pero no devolvió contenido por stdout. Se verificará mediante describe-cluster."
     fi
 
-    log_ok "AWS registró create-cluster. Estado inicial: ${create_status:-desconocido}."
+    rm -f "$create_response_file"
     wait_for_cluster_active
     status="ACTIVE"
   fi
