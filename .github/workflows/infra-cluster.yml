@@ -294,33 +294,24 @@ jobs:
           echo "========================================"
           kubectl get pods --all-namespaces -o wide
 
-          echo ""
+      #####################################
+      # 12. VERIFICAR ADD-ONS
+      #####################################
+      - name: Verificar add-ons instalados
+        run: |
+          set -euo pipefail
+
           echo "========================================"
-          echo "ADD-ONS EKS"
+          echo "ADD-ONS INSTALADOS"
           echo "========================================"
+
           aws eks list-addons \
             --region "$AWS_REGION" \
             --cluster-name "$CLUSTER_NAME" \
             --output table \
             --no-cli-pager
 
-      #####################################
-      # 12. VERIFICAR CLOUDWATCH
-      #####################################
-      - name: Verificar CloudWatch Observability
-        if: ${{ inputs.cloudwatch_enabled }}
-        run: |
-          set -euo pipefail
-
-          CLOUDWATCH_STATUS=$(aws eks describe-addon \
-            --region "$AWS_REGION" \
-            --cluster-name "$CLUSTER_NAME" \
-            --addon-name amazon-cloudwatch-observability \
-            --query "addon.status" \
-            --output text \
-            --no-cli-pager)
-
-          POD_IDENTITY_STATUS=$(aws eks describe-addon \
+          POD_STATUS=$(aws eks describe-addon \
             --region "$AWS_REGION" \
             --cluster-name "$CLUSTER_NAME" \
             --addon-name eks-pod-identity-agent \
@@ -328,23 +319,16 @@ jobs:
             --output text \
             --no-cli-pager)
 
-          echo "CloudWatch Observability: $CLOUDWATCH_STATUS"
-          echo "EKS Pod Identity Agent:  $POD_IDENTITY_STATUS"
+          echo ""
+          echo "Pod Identity Agent: $POD_STATUS"
 
-          if [ "$CLOUDWATCH_STATUS" != "ACTIVE" ]; then
-            echo "::error::CloudWatch Observability no está ACTIVE."
-            exit 1
-          fi
-
-          if [ "$POD_IDENTITY_STATUS" != "ACTIVE" ]; then
-            echo "::error::EKS Pod Identity Agent no está ACTIVE."
+          if [ "$POD_STATUS" != "ACTIVE" ]; then
+            echo "::error::eks-pod-identity-agent no está ACTIVE."
             exit 1
           fi
 
           echo ""
-          kubectl get pods \
-            --namespace amazon-cloudwatch \
-            -o wide
+          echo "CloudWatch Observability es opcional en AWS Academy."
 
       #####################################
       # 13. RESUMEN
