@@ -314,10 +314,10 @@ wait_for_cluster_active() {
     else
       rc=$?
       if [[ "$rc" -eq 4 ]]; then
-        if [[ "$attempt" -le 3 ]]; then
-          log_info "El clúster aún no es visible (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
-        else
-          fail "AWS aceptó create-cluster, pero describe-cluster continúa devolviendo ResourceNotFoundException. La creación no quedó registrada en la región ${REGION}."
+        log_info "El clúster aún no es visible (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
+
+        if (( attempt == 12 )); then
+          log_warn "El clúster continúa sin aparecer después de $((attempt * POLL_INTERVAL_SECONDS)) segundos. Se mantendrá el polling hasta agotar el tiempo configurado."
         fi
       else
         return "$rc"
@@ -360,11 +360,7 @@ wait_for_nodegroup_active() {
     else
       rc=$?
       if [[ "$rc" -eq 4 ]]; then
-        if [[ "$attempt" -le 3 ]]; then
-          log_info "El Node Group aún no es visible (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
-        else
-          fail "El Node Group sigue sin existir después de la solicitud de creación."
-        fi
+        log_info "El Node Group aún no es visible (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
       else
         return "$rc"
       fi
@@ -404,11 +400,7 @@ wait_for_addon_active() {
     else
       rc=$?
       if [[ "$rc" -eq 4 ]]; then
-        if [[ "$attempt" -le 3 ]]; then
-          log_info "El add-on '$addon_name' aún no es visible (${attempt}/${ADDON_WAIT_ATTEMPTS})."
-        else
-          fail "El add-on '$addon_name' sigue sin existir después de la solicitud de creación."
-        fi
+        log_info "El add-on '$addon_name' aún no es visible (${attempt}/${ADDON_WAIT_ATTEMPTS})."
       else
         return "$rc"
       fi
