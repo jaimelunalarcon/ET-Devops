@@ -19,10 +19,22 @@ NODE_MIN_SIZE="${NODE_MIN_SIZE:-2}"
 NODE_DESIRED_SIZE="${NODE_DESIRED_SIZE:-2}"
 NODE_MAX_SIZE="${NODE_MAX_SIZE:-3}"
 
+CLOUDWATCH_ENABLED="${CLOUDWATCH_ENABLED:-true}"
+CLOUDWATCH_ROLE_NAME="${CLOUDWATCH_ROLE_NAME:-${CLUSTER_NAME}-cloudwatch-role}"
+CLOUDWATCH_ROLE_ARN="${CLOUDWATCH_ROLE_ARN:-}"
+
 ECR_REPOSITORIES=(
   "tienda-frontend"
   "tienda-backend"
   "tienda-db"
+)
+
+CONTROL_PLANE_LOG_TYPES=(
+  "api"
+  "audit"
+  "authenticator"
+  "controllerManager"
+  "scheduler"
 )
 
 echo "========================================"
@@ -33,6 +45,7 @@ echo "Clúster:            $CLUSTER_NAME"
 echo "Versión Kubernetes: $KUBERNETES_VERSION"
 echo "Node Group:         $NODEGROUP_NAME"
 echo "Instancias:         $NODE_INSTANCE_TYPE"
+echo "CloudWatch:         $CLOUDWATCH_ENABLED"
 echo ""
 
 #####################################
@@ -54,6 +67,11 @@ fail() {
   echo ""
   echo "ERROR: $1" >&2
   exit 1
+}
+
+warning() {
+  echo ""
+  echo "ADVERTENCIA: $1" >&2
 }
 
 validate_integer() {
@@ -86,8 +104,107 @@ get_nodegroup_status() {
     2>/dev/null || true
 }
 
+get_addon_status() {
+  local addon_name="$1"
+
+  aws eks describe-addon \
+    --region "$REGION" \
+    --cluster-name "$CLUSTER_NAME" \
+    --addon-name "$addon_name" \
+    --query "addon.status" \
+    --output text \
+    --no-cli-pager \
+    2>/dev/null || true
+}
+
+wait_for_addon() {
+  local addon_name="$1"
+  local attempts=60
+  local current_attempt=1
+  local status
+
+  echo "Esperando que el add-on $addon_name quede ACTIVE..."
+
+  while [ "$current_attempt" -le "$attempts" ]; do
+    status=$(get_addon_status "$addon_name")
+
+    case "$status" in
+      ACTIVE)
+        echo "Add-on activo: $addon_name"
+        return 0
+        ;;
+
+      CREATE_FAILED | UPDATE_FAILED | DELETE_FAILED | DEGRADED)
+        fail "El add-on $addon_name quedó en estado $status."
+        ;;
+
+      *)
+        sleep 10
+        ;;
+    esac
+
+    current_attempt=$((current_attempt + 1))
+  done
+
+  fail "El add-on $addon_name no quedó ACTIVE."
+}
+
+create_or_update_addon() {
+  local addon_name="$1"
+  local configuration_values="${2:-}"
+  local status
+
+  status=$(get_addon_status "$addon_name")
+
+  if resource_not_found "$status"; then
+    echo "Instalando add-on: $addon_name"
+
+    if [ -n "$configuration_values" ]; then
+      aws eks create-addon \
+        --region "$REGION" \
+        --cluster-name "$CLUSTER_NAME" \
+        --addon-name "$addon_name" \
+        --configuration-values "$configuration_values" \
+        --resolve-conflicts OVERWRITE \
+        --no-cli-pager \
+        >/dev/null
+    else
+      aws eks create-addon \
+        --region "$REGION" \
+        --cluster-name "$CLUSTER_NAME" \
+        --addon-name "$addon_name" \
+        --resolve-conflicts OVERWRITE \
+        --no-cli-pager \
+        >/dev/null
+    fi
+  else
+    echo "Actualizando add-on existente: $addon_name"
+
+    if [ -n "$configuration_values" ]; then
+      aws eks update-addon \
+        --region "$REGION" \
+        --cluster-name "$CLUSTER_NAME" \
+        --addon-name "$addon_name" \
+        --configuration-values "$configuration_values" \
+        --resolve-conflicts OVERWRITE \
+        --no-cli-pager \
+        >/dev/null
+    else
+      aws eks update-addon \
+        --region "$REGION" \
+        --cluster-name "$CLUSTER_NAME" \
+        --addon-name "$addon_name" \
+        --resolve-conflicts OVERWRITE \
+        --no-cli-pager \
+        >/dev/null
+    fi
+  fi
+
+  wait_for_addon "$addon_name"
+}
+
 #####################################
-# 0. VALIDACIONES LOCALES
+# 0. VALIDACIONES
 #####################################
 echo "0. Validando herramientas y configuración..."
 
@@ -143,7 +260,6 @@ VPC_ID=$(aws ec2 describe-vpcs \
   --no-cli-pager)
 
 if resource_not_found "$VPC_ID"; then
-  # Compatibilidad con redes creadas antes de agregar el tag Project.
   VPC_ID=$(aws ec2 describe-vpcs \
     --region "$REGION" \
     --filters \
@@ -165,7 +281,7 @@ VPC_STATE=$(aws ec2 describe-vpcs \
   --no-cli-pager)
 
 if [ "$VPC_STATE" != "available" ]; then
-  fail "La VPC $VPC_ID no está disponible. Estado actual: $VPC_STATE"
+  fail "La VPC $VPC_ID no está disponible. Estado: $VPC_STATE"
 fi
 
 echo "VPC encontrada: $VPC_ID"
@@ -195,11 +311,11 @@ APP_SUBNET_B=$(aws ec2 describe-subnets \
   --no-cli-pager)
 
 if resource_not_found "$APP_SUBNET_A"; then
-  fail "No se encontró la subred ${NETWORK_PROJECT_NAME}-app-a."
+  fail "No se encontró ${NETWORK_PROJECT_NAME}-app-a."
 fi
 
 if resource_not_found "$APP_SUBNET_B"; then
-  fail "No se encontró la subred ${NETWORK_PROJECT_NAME}-app-b."
+  fail "No se encontró ${NETWORK_PROJECT_NAME}-app-b."
 fi
 
 APP_A_AZ=$(aws ec2 describe-subnets \
@@ -243,10 +359,10 @@ echo "Subred APP A: $APP_SUBNET_A ($APP_A_AZ)"
 echo "Subred APP B: $APP_SUBNET_B ($APP_B_AZ)"
 
 #####################################
-# 3. VALIDAR SALIDA A INTERNET
+# 3. VALIDAR RUTAS PRIVADAS
 #####################################
 echo ""
-echo "3. Validando rutas privadas..."
+echo "3. Validando salida mediante NAT Gateway..."
 
 for subnet_id in "$APP_SUBNET_A" "$APP_SUBNET_B"; do
   ROUTE_TARGET=$(aws ec2 describe-route-tables \
@@ -258,7 +374,7 @@ for subnet_id in "$APP_SUBNET_A" "$APP_SUBNET_B"; do
     --no-cli-pager)
 
   if resource_not_found "$ROUTE_TARGET"; then
-    fail "La subred $subnet_id no tiene una ruta 0.0.0.0/0 hacia un NAT Gateway."
+    fail "La subred $subnet_id no tiene una ruta hacia un NAT Gateway."
   fi
 
   NAT_STATE=$(aws ec2 describe-nat-gateways \
@@ -276,10 +392,10 @@ for subnet_id in "$APP_SUBNET_A" "$APP_SUBNET_B"; do
 done
 
 #####################################
-# 4. DESCUBRIR ROLES IAM DE ACADEMY
+# 4. DESCUBRIR ROLES IAM DE EKS
 #####################################
 echo ""
-echo "4. Buscando roles IAM para Amazon EKS..."
+echo "4. Buscando roles IAM de Amazon EKS..."
 
 CLUSTER_ROLE_ARN="${EKS_CLUSTER_ROLE_ARN:-}"
 NODE_ROLE_ARN="${EKS_NODE_ROLE_ARN:-}"
@@ -301,11 +417,11 @@ if resource_not_found "$NODE_ROLE_ARN"; then
 fi
 
 if resource_not_found "$CLUSTER_ROLE_ARN"; then
-  fail "No se encontró un rol que contenga LabEksClusterRole."
+  fail "No se encontró un rol LabEksClusterRole."
 fi
 
 if resource_not_found "$NODE_ROLE_ARN"; then
-  fail "No se encontró un rol que contenga LabEksNodeRole."
+  fail "No se encontró un rol LabEksNodeRole."
 fi
 
 CLUSTER_ROLE_NAME="${CLUSTER_ROLE_ARN##*/}"
@@ -337,7 +453,7 @@ echo "Rol del clúster: $CLUSTER_ROLE_ARN"
 echo "Rol de los nodos: $NODE_ROLE_ARN"
 
 #####################################
-# 5. CREAR REPOSITORIOS ECR
+# 5. REPOSITORIOS ECR
 #####################################
 echo ""
 echo "5. Repositorios Amazon ECR..."
@@ -384,8 +500,9 @@ if resource_not_found "$CLUSTER_STATUS"; then
     --role-arn "$CLUSTER_ROLE_ARN" \
     --resources-vpc-config \
       "subnetIds=${APP_SUBNET_A},${APP_SUBNET_B},endpointPublicAccess=true,endpointPrivateAccess=true" \
-    --kubernetes-network-config \
-      "ipFamily=ipv4" \
+    --kubernetes-network-config "ipFamily=ipv4" \
+    --logging \
+      '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
     --tags \
       Project=tienda \
       Environment=academic \
@@ -427,7 +544,7 @@ esac
 CLUSTER_STATUS=$(get_cluster_status)
 
 if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
-  fail "El clúster no quedó activo. Estado actual: $CLUSTER_STATUS"
+  fail "El clúster no quedó activo. Estado: $CLUSTER_STATUS"
 fi
 
 ACTUAL_KUBERNETES_VERSION=$(aws eks describe-cluster \
@@ -437,17 +554,52 @@ ACTUAL_KUBERNETES_VERSION=$(aws eks describe-cluster \
   --output text \
   --no-cli-pager)
 
-if [ "$ACTUAL_KUBERNETES_VERSION" != "$KUBERNETES_VERSION" ]; then
-  echo "Aviso: el clúster existente usa Kubernetes $ACTUAL_KUBERNETES_VERSION."
-  echo "La variable solicitada era $KUBERNETES_VERSION."
-  echo "El script no modifica automáticamente la versión de un clúster existente."
+#####################################
+# 7. HABILITAR LOGS DEL CONTROL PLANE
+#####################################
+echo ""
+echo "7. Configurando logs del plano de control..."
+
+LOGGING_ENABLED=$(aws eks describe-cluster \
+  --region "$REGION" \
+  --name "$CLUSTER_NAME" \
+  --query \
+    "cluster.logging.clusterLogging[?enabled==\`true\`].types[]" \
+  --output text \
+  --no-cli-pager)
+
+MISSING_CONTROL_PLANE_LOGS=false
+
+for log_type in "${CONTROL_PLANE_LOG_TYPES[@]}"; do
+  if [[ " $LOGGING_ENABLED " != *" $log_type "* ]]; then
+    MISSING_CONTROL_PLANE_LOGS=true
+    break
+  fi
+done
+
+if [ "$MISSING_CONTROL_PLANE_LOGS" = "true" ]; then
+  aws eks update-cluster-config \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --logging \
+      '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
+    --no-cli-pager \
+    >/dev/null
+
+  echo "Actualización de logging enviada."
+
+  aws eks wait cluster-active \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME"
+else
+  echo "Los logs del plano de control ya están habilitados."
 fi
 
 #####################################
-# 7. CONFIGURAR KUBECONFIG
+# 8. CONFIGURAR KUBECONFIG
 #####################################
 echo ""
-echo "7. Configurando kubeconfig..."
+echo "8. Configurando kubeconfig..."
 
 aws eks update-kubeconfig \
   --region "$REGION" \
@@ -458,10 +610,10 @@ aws eks update-kubeconfig \
 echo "Kubeconfig actualizado."
 
 #####################################
-# 8. CREAR MANAGED NODE GROUP
+# 9. CREAR MANAGED NODE GROUP
 #####################################
 echo ""
-echo "8. Managed Node Group..."
+echo "9. Managed Node Group..."
 
 NODEGROUP_STATUS=$(get_nodegroup_status)
 
@@ -479,8 +631,7 @@ if resource_not_found "$NODEGROUP_STATUS"; then
     --disk-size "$NODE_DISK_SIZE" \
     --scaling-config \
       "minSize=${NODE_MIN_SIZE},maxSize=${NODE_MAX_SIZE},desiredSize=${NODE_DESIRED_SIZE}" \
-    --update-config \
-      "maxUnavailable=1" \
+    --update-config "maxUnavailable=1" \
     --labels \
       "workload=tienda,environment=academic" \
     --tags \
@@ -525,14 +676,190 @@ esac
 NODEGROUP_STATUS=$(get_nodegroup_status)
 
 if [ "$NODEGROUP_STATUS" != "ACTIVE" ]; then
-  fail "El Node Group no quedó activo. Estado actual: $NODEGROUP_STATUS"
+  fail "El Node Group no quedó activo. Estado: $NODEGROUP_STATUS"
 fi
 
 #####################################
-# 9. VERIFICAR KUBERNETES
+# 10. EKS POD IDENTITY AGENT
+#####################################
+if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
+  echo ""
+  echo "10. Instalando EKS Pod Identity Agent..."
+
+  create_or_update_addon "eks-pod-identity-agent"
+
+  if command_exists kubectl; then
+    kubectl rollout status \
+      daemonset/eks-pod-identity-agent \
+      --namespace kube-system \
+      --timeout=300s
+  fi
+else
+  echo ""
+  echo "10. CloudWatch deshabilitado."
+fi
+
+#####################################
+# 11. ROL IAM PARA CLOUDWATCH
+#####################################
+if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
+  echo ""
+  echo "11. Configurando rol IAM para CloudWatch..."
+
+  if resource_not_found "$CLOUDWATCH_ROLE_ARN"; then
+    EXISTING_CLOUDWATCH_ROLE_ARN=$(aws iam get-role \
+      --role-name "$CLOUDWATCH_ROLE_NAME" \
+      --query "Role.Arn" \
+      --output text \
+      --no-cli-pager \
+      2>/dev/null || true)
+
+    if resource_not_found "$EXISTING_CLOUDWATCH_ROLE_ARN"; then
+      TRUST_POLICY_FILE=$(mktemp)
+
+      cat > "$TRUST_POLICY_FILE" <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "pods.eks.amazonaws.com"
+      },
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ]
+    }
+  ]
+}
+EOF
+
+      if ! CLOUDWATCH_ROLE_ARN=$(aws iam create-role \
+        --role-name "$CLOUDWATCH_ROLE_NAME" \
+        --assume-role-policy-document "file://${TRUST_POLICY_FILE}" \
+        --description "Rol Pod Identity para CloudWatch Observability en ${CLUSTER_NAME}" \
+        --tags \
+          Key=Project,Value=tienda \
+          Key=Environment,Value=academic \
+          Key=ManagedBy,Value=crear-eks.sh \
+        --query "Role.Arn" \
+        --output text \
+        --no-cli-pager); then
+
+        rm -f "$TRUST_POLICY_FILE"
+
+        fail "AWS Academy no permitió crear $CLOUDWATCH_ROLE_NAME. Crea un rol para pods.eks.amazonaws.com o proporciona CLOUDWATCH_ROLE_ARN."
+      fi
+
+      rm -f "$TRUST_POLICY_FILE"
+      echo "Rol CloudWatch creado: $CLOUDWATCH_ROLE_ARN"
+    else
+      CLOUDWATCH_ROLE_ARN="$EXISTING_CLOUDWATCH_ROLE_ARN"
+      echo "Rol CloudWatch existente: $CLOUDWATCH_ROLE_ARN"
+    fi
+  else
+    echo "Usando rol CloudWatch proporcionado: $CLOUDWATCH_ROLE_ARN"
+  fi
+
+  CLOUDWATCH_ROLE_NAME="${CLOUDWATCH_ROLE_ARN##*/}"
+
+  CLOUDWATCH_TRUST=$(aws iam get-role \
+    --role-name "$CLOUDWATCH_ROLE_NAME" \
+    --query \
+      "Role.AssumeRolePolicyDocument.Statement[?Principal.Service=='pods.eks.amazonaws.com'] | length(@)" \
+    --output text \
+    --no-cli-pager)
+
+  if [ "$CLOUDWATCH_TRUST" = "0" ]; then
+    fail "El rol $CLOUDWATCH_ROLE_NAME no confía en pods.eks.amazonaws.com."
+  fi
+
+  aws iam attach-role-policy \
+    --role-name "$CLOUDWATCH_ROLE_NAME" \
+    --policy-arn "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy" \
+    --no-cli-pager
+
+  echo "Política CloudWatchAgentServerPolicy asociada."
+fi
+
+#####################################
+# 12. POD IDENTITY ASSOCIATION
+#####################################
+if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
+  echo ""
+  echo "12. Configurando Pod Identity para CloudWatch..."
+
+  POD_IDENTITY_ASSOCIATION_ID=$(aws eks list-pod-identity-associations \
+    --region "$REGION" \
+    --cluster-name "$CLUSTER_NAME" \
+    --query \
+      "associations[?namespace=='amazon-cloudwatch' && serviceAccount=='cloudwatch-agent'].associationId | [0]" \
+    --output text \
+    --no-cli-pager)
+
+  if resource_not_found "$POD_IDENTITY_ASSOCIATION_ID"; then
+    POD_IDENTITY_ASSOCIATION_ID=$(aws eks create-pod-identity-association \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER_NAME" \
+      --namespace "amazon-cloudwatch" \
+      --service-account "cloudwatch-agent" \
+      --role-arn "$CLOUDWATCH_ROLE_ARN" \
+      --tags \
+        Project=tienda \
+        Environment=academic \
+        ManagedBy=crear-eks.sh \
+      --query "association.associationId" \
+      --output text \
+      --no-cli-pager)
+
+    echo "Pod Identity Association creada: $POD_IDENTITY_ASSOCIATION_ID"
+  else
+    CURRENT_CLOUDWATCH_ROLE_ARN=$(aws eks describe-pod-identity-association \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER_NAME" \
+      --association-id "$POD_IDENTITY_ASSOCIATION_ID" \
+      --query "association.roleArn" \
+      --output text \
+      --no-cli-pager)
+
+    if [ "$CURRENT_CLOUDWATCH_ROLE_ARN" != "$CLOUDWATCH_ROLE_ARN" ]; then
+      aws eks update-pod-identity-association \
+        --region "$REGION" \
+        --cluster-name "$CLUSTER_NAME" \
+        --association-id "$POD_IDENTITY_ASSOCIATION_ID" \
+        --role-arn "$CLOUDWATCH_ROLE_ARN" \
+        --no-cli-pager \
+        >/dev/null
+
+      echo "Pod Identity Association actualizada."
+    else
+      echo "Pod Identity Association ya configurada."
+    fi
+  fi
+fi
+
+#####################################
+# 13. CLOUDWATCH OBSERVABILITY ADD-ON
+#####################################
+if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
+  echo ""
+  echo "13. Instalando CloudWatch Observability..."
+
+  CLOUDWATCH_CONFIGURATION='{"otelContainerInsights":{"enabled":true}}'
+
+  create_or_update_addon \
+    "amazon-cloudwatch-observability" \
+    "$CLOUDWATCH_CONFIGURATION"
+
+  echo "CloudWatch Container Insights habilitado."
+fi
+
+#####################################
+# 14. VERIFICAR KUBERNETES
 #####################################
 echo ""
-echo "9. Verificando conexión con Kubernetes..."
+echo "14. Verificando Kubernetes..."
 
 if command_exists kubectl; then
   kubectl config use-context "$CLUSTER_NAME" >/dev/null
@@ -545,29 +872,32 @@ if command_exists kubectl; then
     2>/dev/null |
     awk '$2 == "Ready" {count++} END {print count+0}')
 
-  if [ "$READY_NODE_COUNT" -lt "$NODE_MIN_SIZE" ]; then
+  echo ""
+  echo "Nodos Ready: $READY_NODE_COUNT"
+
+  if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
     echo ""
-    echo "ADVERTENCIA:"
-    echo "El Node Group está activo, pero solo hay $READY_NODE_COUNT nodos Ready."
-    echo "Revisa nuevamente con: kubectl get nodes"
-  else
+    echo "Pods de EKS Pod Identity:"
+    kubectl get pods \
+      --namespace kube-system \
+      -l app.kubernetes.io/name=eks-pod-identity-agent \
+      -o wide || true
+
     echo ""
-    echo "Nodos Ready: $READY_NODE_COUNT"
+    echo "Pods de CloudWatch:"
+    kubectl get pods \
+      --namespace amazon-cloudwatch \
+      -o wide
   fi
 else
-  echo "kubectl no está instalado en este entorno."
-  echo "El kubeconfig quedó preparado."
-  echo ""
-  echo "Cuando kubectl esté disponible, ejecuta:"
-  echo "aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME"
-  echo "kubectl get nodes"
+  warning "kubectl no está instalado. El kubeconfig quedó preparado."
 fi
 
 #####################################
-# 10. OBTENER INFORMACIÓN FINAL
+# 15. INFORMACIÓN FINAL
 #####################################
 echo ""
-echo "10. Obteniendo información final..."
+echo "15. Obteniendo información final..."
 
 CLUSTER_ENDPOINT=$(aws eks describe-cluster \
   --region "$REGION" \
@@ -590,6 +920,14 @@ NODEGROUP_ASG=$(aws eks describe-nodegroup \
   --query "nodegroup.resources.autoScalingGroups[0].name" \
   --output text \
   --no-cli-pager)
+
+if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
+  POD_IDENTITY_STATUS=$(get_addon_status "eks-pod-identity-agent")
+  CLOUDWATCH_STATUS=$(get_addon_status "amazon-cloudwatch-observability")
+else
+  POD_IDENTITY_STATUS="DISABLED"
+  CLOUDWATCH_STATUS="DISABLED"
+fi
 
 #####################################
 # RESUMEN
@@ -617,13 +955,29 @@ echo "Tipo de instancia:      $NODE_INSTANCE_TYPE"
 echo "Escalamiento:           $NODE_MIN_SIZE/$NODE_DESIRED_SIZE/$NODE_MAX_SIZE"
 echo "Auto Scaling Group:     $NODEGROUP_ASG"
 echo ""
+echo "Observabilidad:"
+echo "  Control Plane Logs:   ENABLED"
+echo "  Pod Identity Agent:   $POD_IDENTITY_STATUS"
+echo "  CloudWatch Add-on:    $CLOUDWATCH_STATUS"
+
+if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
+  echo "  CloudWatch Role:      $CLOUDWATCH_ROLE_ARN"
+fi
+
+echo ""
 echo "Repositorios ECR:"
 for repository in "${ECR_REPOSITORIES[@]}"; do
   echo "  ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${repository}"
 done
+
 echo ""
-echo "Comandos siguientes:"
+echo "Comandos de verificación:"
 echo "  aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME"
 echo "  kubectl get nodes"
 echo "  kubectl get pods --all-namespaces"
+echo "  kubectl get pods -n amazon-cloudwatch"
+echo ""
+echo "CloudWatch:"
+echo "  AWS Console → CloudWatch → Container Insights"
+echo "  AWS Console → CloudWatch → Log groups"
 echo "========================================"
