@@ -1,0 +1,54 @@
+name: CI/CD Tienda Perritos - Backend
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "backend/**"
+
+jobs:
+  build-push-deploy-backend:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v3
+
+    - name: Configurar credenciales AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Login en Amazon ECR (runner)
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build imagen Backend y push a ECR
+      run: |
+        cd backend
+        docker build -t tienda-backend .
+        docker tag tienda-backend:latest ${{ secrets.ECR_REPO_URL_BACKEND }}:latest
+        docker push ${{ secrets.ECR_REPO_URL_BACKEND }}:latest
+
+    - name: Pausa de estabilización SSM
+      run: sleep 60
+
+    - name: Desplegar Backend vía SSM
+      run: |
+        aws ssm send-command \
+          --instance-ids ${{ secrets.EC2_BACKEND_INSTANCE_ID }} \
+          --document-name "AWS-RunShellScript" \
+          --comment "Actualizar tienda-backend desde ECR" \
+          --parameters '{"commands":[
+            "set -e",
+            "export PATH=$PATH:/usr/local/bin",
+            "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}",
+            "sudo docker pull ${{ secrets.ECR_REPO_URL_BACKEND }}:latest",
+            "sudo docker stop tienda-backend || true",
+            "sudo docker rm tienda-backend || true",
+            "sudo docker run -d --name tienda-backend -p 3001:3001 ${{ secrets.ECR_REPO_URL_BACKEND }}:latest"
+          ]}' \
+          --output text
+          

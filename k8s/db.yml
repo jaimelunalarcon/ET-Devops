@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tienda-db
+  namespace: tienda
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tienda-db
+  template:
+    metadata:
+      labels:
+        app: tienda-db
+    spec:
+      containers:
+        - name: tienda-db
+          image: 884162705864.dkr.ecr.us-east-1.amazonaws.com/tienda-db:latest
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: "admin123"
+            - name: MYSQL_DATABASE
+              value: "tienda_perritos"
+            - name: MYSQL_USER
+              value: "alumno"
+            - name: MYSQL_PASSWORD
+              value: "alumno123"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tienda-db
+  namespace: tienda
+spec:
+  type: ClusterIP
+  selector:
+    app: tienda-db
+  ports:
+    - port: 3306
+      targetPort: 3306

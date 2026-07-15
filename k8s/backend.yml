@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tienda-backend
+  namespace: tienda
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tienda-backend
+  template:
+    metadata:
+      labels:
+        app: tienda-backend
+    spec:
+      containers:
+        - name: tienda-backend
+          image: 884162705864.dkr.ecr.us-east-1.amazonaws.com/tienda-backend:latest
+          ports:
+            - containerPort: 3001
+          env:
+            - name: PORT
+              value: "3001"
+            - name: DB_HOST
+              value: "tienda-db"
+            - name: DB_USER
+              value: "root"
+            - name: DB_PASSWORD
+              value: "admin123"
+            - name: DB_NAME
+              value: "tienda_perritos"
+            - name: DB_PORT
+              value: "3306"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tienda-backend
+  namespace: tienda
+spec:
+  type: ClusterIP
+  selector:
+    app: tienda-backend
+  ports:
+    - port: 3001
+      targetPort: 3001
