@@ -117,6 +117,54 @@ get_addon_status() {
     2>/dev/null || true
 }
 
+wait_for_cluster_visibility() {
+  local attempts=30
+  local current_attempt=1
+  local status
+
+  echo "Esperando que el clúster sea visible en la API de EKS..."
+
+  while [ "$current_attempt" -le "$attempts" ]; do
+    status=$(get_cluster_status)
+
+    if ! resource_not_found "$status"; then
+      echo "Clúster visible. Estado actual: $status"
+      return 0
+    fi
+
+    echo "Clúster todavía no visible. Reintento ${current_attempt}/${attempts}..."
+    sleep 10
+
+    current_attempt=$((current_attempt + 1))
+  done
+
+  fail "EKS aceptó la creación, pero el clúster no apareció en la API."
+}
+
+wait_for_nodegroup_visibility() {
+  local attempts=30
+  local current_attempt=1
+  local status
+
+  echo "Esperando que el Node Group sea visible en la API de EKS..."
+
+  while [ "$current_attempt" -le "$attempts" ]; do
+    status=$(get_nodegroup_status)
+
+    if ! resource_not_found "$status"; then
+      echo "Node Group visible. Estado actual: $status"
+      return 0
+    fi
+
+    echo "Node Group todavía no visible. Reintento ${current_attempt}/${attempts}..."
+    sleep 10
+
+    current_attempt=$((current_attempt + 1))
+  done
+
+  fail "EKS aceptó la creación, pero el Node Group no apareció en la API."
+}
+
 wait_for_addon() {
   local addon_name="$1"
   local attempts=60
@@ -139,6 +187,7 @@ wait_for_addon() {
         ;;
 
       *)
+        echo "Add-on $addon_name en estado ${status:-no-visible}. Reintento ${current_attempt}/${attempts}..."
         sleep 10
         ;;
     esac
@@ -510,8 +559,10 @@ if resource_not_found "$CLUSTER_STATUS"; then
     --no-cli-pager \
     >/dev/null
 
-  CLUSTER_STATUS="CREATING"
   echo "Solicitud de creación enviada."
+
+  wait_for_cluster_visibility
+  CLUSTER_STATUS=$(get_cluster_status)
 else
   echo "El clúster ya existe."
   echo "Estado actual: $CLUSTER_STATUS"
@@ -555,7 +606,7 @@ ACTUAL_KUBERNETES_VERSION=$(aws eks describe-cluster \
   --no-cli-pager)
 
 #####################################
-# 7. HABILITAR LOGS DEL CONTROL PLANE
+# 7. LOGS DEL CONTROL PLANE
 #####################################
 echo ""
 echo "7. Configurando logs del plano de control..."
@@ -641,8 +692,10 @@ if resource_not_found "$NODEGROUP_STATUS"; then
     --no-cli-pager \
     >/dev/null
 
-  NODEGROUP_STATUS="CREATING"
   echo "Solicitud de creación enviada."
+
+  wait_for_nodegroup_visibility
+  NODEGROUP_STATUS=$(get_nodegroup_status)
 else
   echo "El Node Group ya existe."
   echo "Estado actual: $NODEGROUP_STATUS"
@@ -749,7 +802,7 @@ EOF
 
         rm -f "$TRUST_POLICY_FILE"
 
-        fail "AWS Academy no permitió crear $CLOUDWATCH_ROLE_NAME. Crea un rol para pods.eks.amazonaws.com o proporciona CLOUDWATCH_ROLE_ARN."
+        fail "AWS Academy no permitió crear $CLOUDWATCH_ROLE_NAME. Proporciona CLOUDWATCH_ROLE_ARN."
       fi
 
       rm -f "$TRUST_POLICY_FILE"
