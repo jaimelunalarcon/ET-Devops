@@ -576,9 +576,7 @@ case "$CLUSTER_STATUS" in
   CREATING | UPDATING)
     echo "Esperando que el clúster quede ACTIVE..."
 
-    aws eks wait cluster-active \
-      --region "$REGION" \
-      --name "$CLUSTER_NAME"
+   wait_for_cluster_active
 
     echo "Clúster activo."
     ;;
@@ -639,9 +637,8 @@ if [ "$MISSING_CONTROL_PLANE_LOGS" = "true" ]; then
 
   echo "Actualización de logging enviada."
 
-  aws eks wait cluster-active \
-    --region "$REGION" \
-    --name "$CLUSTER_NAME"
+  wait_for_cluster_active 
+
 else
   echo "Los logs del plano de control ya están habilitados."
 fi
