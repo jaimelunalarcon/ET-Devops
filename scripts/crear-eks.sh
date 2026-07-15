@@ -632,27 +632,43 @@ validate_nat_route() {
 # IAM EXISTENTE DE AWS ACADEMY
 #######################################
 resolve_role_arn() {
-  local supplied_arn="$1"
-  local role_name="$2"
-  local role_arn rc
+  local supplied_arn="${1:-}"
+  local role_pattern="$2"
+  local role_count role_arn
 
-  if [[ -n "$supplied_arn" ]]; then
+  # Permite proporcionar el ARN explícitamente desde GitHub Actions.
+  if [[ -n "$supplied_arn" && "$supplied_arn" != "None" && "$supplied_arn" != "null" ]]; then
     printf '%s\n' "$supplied_arn"
     return 0
   fi
 
-  if role_arn=$(get_role_arn "$role_name"); then
-    printf '%s\n' "$role_arn"
-    return 0
-  else
-    rc=$?
-  fi
+  # AWS Academy agrega prefijos y sufijos dinámicos a los nombres de roles.
+  # Por eso buscamos por coincidencia parcial, no por nombre exacto.
+  role_count=$(aws iam list-roles \
+    --query "length(Roles[?contains(RoleName, '${role_pattern}')])" \
+    --output text \
+    --no-cli-pager)
 
-  if [[ "$rc" -eq 4 ]]; then
-    fail "No se encontró el rol IAM '$role_name' proporcionado por AWS Academy."
-  fi
+  case "$role_count" in
+    0)
+      fail "No se encontró ningún rol IAM cuyo nombre contenga '$role_pattern'."
+      ;;
+    1)
+      ;;
+    *)
+      fail "Se encontraron $role_count roles IAM cuyo nombre contiene '$role_pattern'. Proporciona el ARN explícitamente mediante la variable correspondiente."
+      ;;
+  esac
 
-  return "$rc"
+  role_arn=$(aws iam list-roles \
+    --query "Roles[?contains(RoleName, '${role_pattern}')].Arn | [0]" \
+    --output text \
+    --no-cli-pager)
+
+  resource_not_found "$role_arn" &&
+    fail "No fue posible resolver el ARN del rol IAM que contiene '$role_pattern'."
+
+  printf '%s\n' "$role_arn"
 }
 
 validate_role_trust() {
