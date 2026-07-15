@@ -1,1033 +1,1189 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-#####################################
+#######################################
 # CONFIGURACIÓN
-#####################################
-NETWORK_PROJECT_NAME="${NETWORK_PROJECT_NAME:-red-lab}"
+#######################################
+readonly NETWORK_PROJECT_NAME="${NETWORK_PROJECT_NAME:-red-lab}"
+readonly PROJECT_NAME="${PROJECT_NAME:-tienda}"
+readonly ENVIRONMENT="${ENVIRONMENT:-academic}"
 
-CLUSTER_NAME="${CLUSTER_NAME:-tienda-eks}"
-NODEGROUP_NAME="${NODEGROUP_NAME:-tienda-nodegroup}"
+readonly CLUSTER_NAME="${CLUSTER_NAME:-tienda-eks}"
+readonly NODEGROUP_NAME="${NODEGROUP_NAME:-tienda-nodegroup}"
+readonly REGION="${AWS_REGION:-us-east-1}"
+readonly KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.35}"
 
-REGION="${AWS_REGION:-us-east-1}"
-KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.35}"
+readonly NODE_INSTANCE_TYPE="${NODE_INSTANCE_TYPE:-t3.medium}"
+readonly NODE_DISK_SIZE="${NODE_DISK_SIZE:-20}"
+readonly NODE_MIN_SIZE="${NODE_MIN_SIZE:-2}"
+readonly NODE_DESIRED_SIZE="${NODE_DESIRED_SIZE:-2}"
+readonly NODE_MAX_SIZE="${NODE_MAX_SIZE:-3}"
 
-NODE_INSTANCE_TYPE="${NODE_INSTANCE_TYPE:-t3.medium}"
-NODE_DISK_SIZE="${NODE_DISK_SIZE:-20}"
+readonly EKS_CLUSTER_ROLE_NAME="${EKS_CLUSTER_ROLE_NAME:-LabEksClusterRole}"
+readonly EKS_NODE_ROLE_NAME="${EKS_NODE_ROLE_NAME:-LabEksNodeRole}"
+readonly EKS_CLUSTER_ROLE_ARN="${EKS_CLUSTER_ROLE_ARN:-}"
+readonly EKS_NODE_ROLE_ARN="${EKS_NODE_ROLE_ARN:-}"
 
-NODE_MIN_SIZE="${NODE_MIN_SIZE:-2}"
-NODE_DESIRED_SIZE="${NODE_DESIRED_SIZE:-2}"
-NODE_MAX_SIZE="${NODE_MAX_SIZE:-3}"
+readonly CLOUDWATCH_ENABLED="${CLOUDWATCH_ENABLED:-true}"
+readonly CLOUDWATCH_ROLE_NAME="${CLOUDWATCH_ROLE_NAME:-${CLUSTER_NAME}-cloudwatch-role}"
+readonly CLOUDWATCH_ROLE_ARN_INPUT="${CLOUDWATCH_ROLE_ARN:-}"
 
-CLOUDWATCH_ENABLED="${CLOUDWATCH_ENABLED:-true}"
-CLOUDWATCH_ROLE_NAME="${CLOUDWATCH_ROLE_NAME:-${CLUSTER_NAME}-cloudwatch-role}"
-CLOUDWATCH_ROLE_ARN="${CLOUDWATCH_ROLE_ARN:-}"
+readonly CLUSTER_WAIT_ATTEMPTS="${CLUSTER_WAIT_ATTEMPTS:-120}"
+readonly NODEGROUP_WAIT_ATTEMPTS="${NODEGROUP_WAIT_ATTEMPTS:-120}"
+readonly ADDON_WAIT_ATTEMPTS="${ADDON_WAIT_ATTEMPTS:-60}"
+readonly POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 
-ECR_REPOSITORIES=(
-  "tienda-frontend"
-  "tienda-backend"
-  "tienda-db"
+readonly -a ECR_REPOSITORIES=(
+  "${PROJECT_NAME}-frontend"
+  "${PROJECT_NAME}-backend"
+  "${PROJECT_NAME}-db"
 )
 
-CONTROL_PLANE_LOG_TYPES=(
-  "api"
-  "audit"
-  "authenticator"
-  "controllerManager"
-  "scheduler"
+readonly -a CONTROL_PLANE_LOG_TYPES=(
+  api
+  audit
+  authenticator
+  controllerManager
+  scheduler
 )
 
-echo "========================================"
-echo "CREACIÓN DE AMAZON ECR Y AMAZON EKS"
-echo "========================================"
-echo "Región:             $REGION"
-echo "Clúster:            $CLUSTER_NAME"
-echo "Versión Kubernetes: $KUBERNETES_VERSION"
-echo "Node Group:         $NODEGROUP_NAME"
-echo "Instancias:         $NODE_INSTANCE_TYPE"
-echo "CloudWatch:         $CLOUDWATCH_ENABLED"
-echo ""
-
-#####################################
-# FUNCIONES AUXILIARES
-#####################################
-resource_not_found() {
-  local value="${1:-}"
-
-  [ -z "$value" ] ||
-    [ "$value" = "None" ] ||
-    [ "$value" = "null" ]
+#######################################
+# LOGS Y ERRORES
+#######################################
+log_info() {
+  printf '\n\033[1;34m[INFO]\033[0m %s\n' "$*"
 }
 
+log_ok() {
+  printf '\033[1;32m[OK]\033[0m %s\n' "$*"
+}
+
+log_warn() {
+  printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2
+}
+
+log_error() {
+  printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2
+}
+
+fail() {
+  log_error "$*"
+  exit 1
+}
+
+on_error() {
+  local exit_code=$?
+  local line_number="${BASH_LINENO[0]:-desconocida}"
+  local failed_command="${BASH_COMMAND:-desconocido}"
+
+  log_error "El script terminó inesperadamente."
+  log_error "Línea: ${line_number}"
+  log_error "Comando: ${failed_command}"
+  log_error "Código de salida: ${exit_code}"
+  exit "$exit_code"
+}
+
+trap on_error ERR
+
+#######################################
+# FUNCIONES GENERALES
+#######################################
 command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
-fail() {
-  echo ""
-  echo "ERROR: $1" >&2
-  exit 1
-}
-
-warning() {
-  echo ""
-  echo "ADVERTENCIA: $1" >&2
+require_command() {
+  command_exists "$1" || fail "La herramienta '$1' no está instalada o no está disponible en PATH."
 }
 
 validate_integer() {
   local name="$1"
   local value="$2"
 
-  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+  [[ "$value" =~ ^[0-9]+$ ]] ||
     fail "$name debe ser un número entero. Valor recibido: $value"
-  fi
 }
 
+validate_boolean() {
+  local name="$1"
+  local value="$2"
+
+  case "$value" in
+    true | false) ;;
+    *) fail "$name debe ser 'true' o 'false'. Valor recibido: $value" ;;
+  esac
+}
+
+is_empty_aws_value() {
+  local value="${1:-}"
+  [[ -z "$value" || "$value" == "None" || "$value" == "null" ]]
+}
+
+make_temp_file() {
+  mktemp "${TMPDIR:-/tmp}/crear-eks.XXXXXX"
+}
+
+print_header() {
+  cat <<EOF_HEADER
+
+========================================
+CREACIÓN DE AMAZON ECR Y AMAZON EKS
+========================================
+Región:             ${REGION}
+Clúster:            ${CLUSTER_NAME}
+Versión Kubernetes: ${KUBERNETES_VERSION}
+Node Group:         ${NODEGROUP_NAME}
+Instancia:          ${NODE_INSTANCE_TYPE}
+Escalamiento:       ${NODE_MIN_SIZE}/${NODE_DESIRED_SIZE}/${NODE_MAX_SIZE}
+CloudWatch:         ${CLOUDWATCH_ENABLED}
+
+EOF_HEADER
+}
+
+#######################################
+# CONSULTAS AWS SIN OCULTAR ERRORES
+# Retorno 0: recurso encontrado
+# Retorno 4: recurso no encontrado
+# Otros errores: el script termina mostrando AWS
+#######################################
 get_cluster_status() {
-  aws eks describe-cluster \
+  local error_file output exit_code
+  error_file=$(make_temp_file)
+
+  if output=$(aws eks describe-cluster \
     --region "$REGION" \
     --name "$CLUSTER_NAME" \
-    --query "cluster.status" \
+    --query 'cluster.status' \
     --output text \
     --no-cli-pager \
-    2>/dev/null || true
+    2>"$error_file"); then
+    rm -f "$error_file"
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  exit_code=$?
+  if grep -q 'ResourceNotFoundException' "$error_file"; then
+    rm -f "$error_file"
+    return 4
+  fi
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  fail "No fue posible consultar el clúster EKS (código AWS CLI: $exit_code)."
 }
 
 get_nodegroup_status() {
+  local error_file output exit_code
+  error_file=$(make_temp_file)
+
+  if output=$(aws eks describe-nodegroup \
+    --region "$REGION" \
+    --cluster-name "$CLUSTER_NAME" \
+    --nodegroup-name "$NODEGROUP_NAME" \
+    --query 'nodegroup.status' \
+    --output text \
+    --no-cli-pager \
+    2>"$error_file"); then
+    rm -f "$error_file"
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  exit_code=$?
+  if grep -q 'ResourceNotFoundException' "$error_file"; then
+    rm -f "$error_file"
+    return 4
+  fi
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  fail "No fue posible consultar el Managed Node Group (código AWS CLI: $exit_code)."
+}
+
+get_addon_status() {
+  local addon_name="$1"
+  local error_file output exit_code
+  error_file=$(make_temp_file)
+
+  if output=$(aws eks describe-addon \
+    --region "$REGION" \
+    --cluster-name "$CLUSTER_NAME" \
+    --addon-name "$addon_name" \
+    --query 'addon.status' \
+    --output text \
+    --no-cli-pager \
+    2>"$error_file"); then
+    rm -f "$error_file"
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  exit_code=$?
+  if grep -q 'ResourceNotFoundException' "$error_file"; then
+    rm -f "$error_file"
+    return 4
+  fi
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  fail "No fue posible consultar el add-on '$addon_name' (código AWS CLI: $exit_code)."
+}
+
+get_role_arn() {
+  local role_name="$1"
+  local error_file output exit_code
+  error_file=$(make_temp_file)
+
+  if output=$(aws iam get-role \
+    --role-name "$role_name" \
+    --query 'Role.Arn' \
+    --output text \
+    --no-cli-pager \
+    2>"$error_file"); then
+    rm -f "$error_file"
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  exit_code=$?
+  if grep -qE 'NoSuchEntity|cannot be found' "$error_file"; then
+    rm -f "$error_file"
+    return 4
+  fi
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  fail "No fue posible consultar el rol IAM '$role_name' (código AWS CLI: $exit_code)."
+}
+
+repository_exists() {
+  local repository_name="$1"
+  local error_file exit_code
+  error_file=$(make_temp_file)
+
+  if aws ecr describe-repositories \
+    --region "$REGION" \
+    --repository-names "$repository_name" \
+    --no-cli-pager \
+    >/dev/null 2>"$error_file"; then
+    rm -f "$error_file"
+    return 0
+  fi
+
+  exit_code=$?
+  if grep -q 'RepositoryNotFoundException' "$error_file"; then
+    rm -f "$error_file"
+    return 4
+  fi
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  fail "No fue posible consultar ECR '$repository_name' (código AWS CLI: $exit_code)."
+}
+
+#######################################
+# ESPERAS CONTROLADAS
+#######################################
+wait_for_cluster_active() {
+  local attempt status rc
+
+  log_info "Esperando que el clúster quede ACTIVE..."
+
+  for ((attempt = 1; attempt <= CLUSTER_WAIT_ATTEMPTS; attempt++)); do
+    if status=$(get_cluster_status); then
+      case "$status" in
+        ACTIVE)
+          log_ok "Clúster activo."
+          return 0
+          ;;
+        FAILED)
+          show_cluster_health_issues
+          fail "El clúster quedó en estado FAILED."
+          ;;
+        DELETING)
+          fail "El clúster está siendo eliminado."
+          ;;
+        CREATING | UPDATING | PENDING)
+          log_info "Estado del clúster: $status (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
+          ;;
+        *)
+          log_warn "Estado inesperado del clúster: $status (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
+          ;;
+      esac
+    else
+      rc=$?
+      if [[ "$rc" -eq 4 ]]; then
+        if [[ "$attempt" -le 3 ]]; then
+          log_info "El clúster aún no es visible (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
+        else
+          fail "AWS aceptó create-cluster, pero describe-cluster continúa devolviendo ResourceNotFoundException. La creación no quedó registrada en la región ${REGION}."
+        fi
+      else
+        return "$rc"
+      fi
+    fi
+
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+
+  show_cluster_health_issues
+  fail "El clúster no quedó ACTIVE tras $((CLUSTER_WAIT_ATTEMPTS * POLL_INTERVAL_SECONDS)) segundos."
+}
+
+wait_for_nodegroup_active() {
+  local attempt status rc
+
+  log_info "Esperando que el Managed Node Group quede ACTIVE..."
+
+  for ((attempt = 1; attempt <= NODEGROUP_WAIT_ATTEMPTS; attempt++)); do
+    if status=$(get_nodegroup_status); then
+      case "$status" in
+        ACTIVE)
+          log_ok "Managed Node Group activo."
+          return 0
+          ;;
+        CREATE_FAILED | DELETE_FAILED | DEGRADED)
+          show_nodegroup_health_issues
+          fail "El Managed Node Group quedó en estado $status."
+          ;;
+        DELETING)
+          fail "El Managed Node Group está siendo eliminado."
+          ;;
+        CREATING | UPDATING)
+          log_info "Estado del Node Group: $status (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
+          ;;
+        *)
+          log_warn "Estado inesperado del Node Group: $status (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
+          ;;
+      esac
+    else
+      rc=$?
+      if [[ "$rc" -eq 4 ]]; then
+        if [[ "$attempt" -le 3 ]]; then
+          log_info "El Node Group aún no es visible (${attempt}/${NODEGROUP_WAIT_ATTEMPTS})."
+        else
+          fail "El Node Group sigue sin existir después de la solicitud de creación."
+        fi
+      else
+        return "$rc"
+      fi
+    fi
+
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+
+  show_nodegroup_health_issues
+  fail "El Node Group no quedó ACTIVE tras $((NODEGROUP_WAIT_ATTEMPTS * POLL_INTERVAL_SECONDS)) segundos."
+}
+
+wait_for_addon_active() {
+  local addon_name="$1"
+  local attempt status rc
+
+  log_info "Esperando que el add-on '$addon_name' quede ACTIVE..."
+
+  for ((attempt = 1; attempt <= ADDON_WAIT_ATTEMPTS; attempt++)); do
+    if status=$(get_addon_status "$addon_name"); then
+      case "$status" in
+        ACTIVE)
+          log_ok "Add-on activo: $addon_name"
+          return 0
+          ;;
+        CREATE_FAILED | UPDATE_FAILED | DELETE_FAILED | DEGRADED)
+          show_addon_health_issues "$addon_name"
+          fail "El add-on '$addon_name' quedó en estado $status."
+          ;;
+        CREATING | UPDATING)
+          log_info "Add-on $addon_name: $status (${attempt}/${ADDON_WAIT_ATTEMPTS})."
+          ;;
+        *)
+          log_warn "Estado inesperado de $addon_name: $status (${attempt}/${ADDON_WAIT_ATTEMPTS})."
+          ;;
+      esac
+    else
+      rc=$?
+      if [[ "$rc" -eq 4 ]]; then
+        if [[ "$attempt" -le 3 ]]; then
+          log_info "El add-on '$addon_name' aún no es visible (${attempt}/${ADDON_WAIT_ATTEMPTS})."
+        else
+          fail "El add-on '$addon_name' sigue sin existir después de la solicitud de creación."
+        fi
+      else
+        return "$rc"
+      fi
+    fi
+
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+
+  show_addon_health_issues "$addon_name"
+  fail "El add-on '$addon_name' no quedó ACTIVE."
+}
+
+wait_for_cluster_update() {
+  local update_id="$1"
+  local attempt status
+
+  log_info "Esperando actualización del clúster: $update_id"
+
+  for ((attempt = 1; attempt <= CLUSTER_WAIT_ATTEMPTS; attempt++)); do
+    status=$(aws eks describe-update \
+      --region "$REGION" \
+      --name "$CLUSTER_NAME" \
+      --update-id "$update_id" \
+      --query 'update.status' \
+      --output text \
+      --no-cli-pager)
+
+    case "$status" in
+      Successful)
+        log_ok "Actualización del clúster completada."
+        return 0
+        ;;
+      Failed | Cancelled)
+        aws eks describe-update \
+          --region "$REGION" \
+          --name "$CLUSTER_NAME" \
+          --update-id "$update_id" \
+          --query 'update.errors' \
+          --output json \
+          --no-cli-pager >&2 || true
+        fail "La actualización del clúster terminó en estado $status."
+        ;;
+      InProgress)
+        log_info "Actualización en progreso (${attempt}/${CLUSTER_WAIT_ATTEMPTS})."
+        ;;
+      *)
+        log_warn "Estado inesperado de la actualización: $status."
+        ;;
+    esac
+
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+
+  fail "La actualización del clúster excedió el tiempo máximo de espera."
+}
+
+#######################################
+# DIAGNÓSTICO
+#######################################
+show_cluster_health_issues() {
+  aws eks describe-cluster \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --query 'cluster.health.issues' \
+    --output json \
+    --no-cli-pager >&2 || true
+}
+
+show_nodegroup_health_issues() {
   aws eks describe-nodegroup \
     --region "$REGION" \
     --cluster-name "$CLUSTER_NAME" \
     --nodegroup-name "$NODEGROUP_NAME" \
-    --query "nodegroup.status" \
-    --output text \
-    --no-cli-pager \
-    2>/dev/null || true
+    --query 'nodegroup.health.issues' \
+    --output json \
+    --no-cli-pager >&2 || true
 }
 
-get_addon_status() {
+show_addon_health_issues() {
   local addon_name="$1"
 
   aws eks describe-addon \
     --region "$REGION" \
     --cluster-name "$CLUSTER_NAME" \
     --addon-name "$addon_name" \
-    --query "addon.status" \
-    --output text \
-    --no-cli-pager \
-    2>/dev/null || true
+    --query 'addon.health.issues' \
+    --output json \
+    --no-cli-pager >&2 || true
 }
 
-wait_for_cluster_active() {
-  local attempts=90
-  local current_attempt=1
-  local status
+#######################################
+# RED
+#######################################
+find_vpc() {
+  local vpc_id
 
-  echo "Esperando que el clúster $CLUSTER_NAME quede ACTIVE..."
-
-  while [ "$current_attempt" -le "$attempts" ]; do
-    status=$(get_cluster_status)
-
-    case "$status" in
-      ACTIVE)
-        echo "Clúster activo."
-        return 0
-        ;;
-
-      CREATING | UPDATING)
-        echo "Estado del clúster: $status. Reintento ${current_attempt}/${attempts}..."
-        ;;
-
-      FAILED)
-        fail "El clúster quedó en estado FAILED."
-        ;;
-
-      DELETING)
-        fail "El clúster está siendo eliminado."
-        ;;
-
-      "")
-        echo "El clúster todavía no es visible. Reintento ${current_attempt}/${attempts}..."
-        ;;
-
-      None | null)
-        echo "El clúster todavía no es visible. Reintento ${current_attempt}/${attempts}..."
-        ;;
-
-      *)
-        echo "Estado temporal o desconocido: $status. Reintento ${current_attempt}/${attempts}..."
-        ;;
-    esac
-
-    sleep 10
-    current_attempt=$((current_attempt + 1))
-  done
-
-  fail "El clúster no quedó ACTIVE después de 15 minutos."
-}
-
-wait_for_addon() {
-  local addon_name="$1"
-  local attempts=60
-  local current_attempt=1
-  local status
-
-  echo "Esperando que el add-on $addon_name quede ACTIVE..."
-
-  while [ "$current_attempt" -le "$attempts" ]; do
-    status=$(get_addon_status "$addon_name")
-
-    case "$status" in
-      ACTIVE)
-        echo "Add-on activo: $addon_name"
-        return 0
-        ;;
-
-      CREATE_FAILED | UPDATE_FAILED | DELETE_FAILED | DEGRADED)
-        fail "El add-on $addon_name quedó en estado $status."
-        ;;
-
-      *)
-        echo "Add-on $addon_name en estado ${status:-no-visible}. Reintento ${current_attempt}/${attempts}..."
-        sleep 10
-        ;;
-    esac
-
-    current_attempt=$((current_attempt + 1))
-  done
-
-  fail "El add-on $addon_name no quedó ACTIVE."
-}
-
-create_or_update_addon() {
-  local addon_name="$1"
-  local configuration_values="${2:-}"
-  local status
-
-  status=$(get_addon_status "$addon_name")
-
-  if resource_not_found "$status"; then
-    echo "Instalando add-on: $addon_name"
-
-    if [ -n "$configuration_values" ]; then
-      aws eks create-addon \
-        --region "$REGION" \
-        --cluster-name "$CLUSTER_NAME" \
-        --addon-name "$addon_name" \
-        --configuration-values "$configuration_values" \
-        --resolve-conflicts OVERWRITE \
-        --no-cli-pager \
-        >/dev/null
-    else
-      aws eks create-addon \
-        --region "$REGION" \
-        --cluster-name "$CLUSTER_NAME" \
-        --addon-name "$addon_name" \
-        --resolve-conflicts OVERWRITE \
-        --no-cli-pager \
-        >/dev/null
-    fi
-  else
-    echo "Actualizando add-on existente: $addon_name"
-
-    if [ -n "$configuration_values" ]; then
-      aws eks update-addon \
-        --region "$REGION" \
-        --cluster-name "$CLUSTER_NAME" \
-        --addon-name "$addon_name" \
-        --configuration-values "$configuration_values" \
-        --resolve-conflicts OVERWRITE \
-        --no-cli-pager \
-        >/dev/null
-    else
-      aws eks update-addon \
-        --region "$REGION" \
-        --cluster-name "$CLUSTER_NAME" \
-        --addon-name "$addon_name" \
-        --resolve-conflicts OVERWRITE \
-        --no-cli-pager \
-        >/dev/null
-    fi
-  fi
-
-  wait_for_addon "$addon_name"
-}
-
-#####################################
-# 0. VALIDACIONES
-#####################################
-echo "0. Validando herramientas y configuración..."
-
-command_exists aws ||
-  fail "AWS CLI no está instalado o no está disponible en el PATH."
-
-validate_integer "NODE_MIN_SIZE" "$NODE_MIN_SIZE"
-validate_integer "NODE_DESIRED_SIZE" "$NODE_DESIRED_SIZE"
-validate_integer "NODE_MAX_SIZE" "$NODE_MAX_SIZE"
-validate_integer "NODE_DISK_SIZE" "$NODE_DISK_SIZE"
-
-if [ "$NODE_MIN_SIZE" -gt "$NODE_DESIRED_SIZE" ]; then
-  fail "NODE_MIN_SIZE no puede ser mayor que NODE_DESIRED_SIZE."
-fi
-
-if [ "$NODE_DESIRED_SIZE" -gt "$NODE_MAX_SIZE" ]; then
-  fail "NODE_DESIRED_SIZE no puede ser mayor que NODE_MAX_SIZE."
-fi
-
-IDENTITY_ARN=$(aws sts get-caller-identity \
-  --region "$REGION" \
-  --query "Arn" \
-  --output text \
-  --no-cli-pager)
-
-ACCOUNT_ID=$(aws sts get-caller-identity \
-  --region "$REGION" \
-  --query "Account" \
-  --output text \
-  --no-cli-pager)
-
-if resource_not_found "$ACCOUNT_ID"; then
-  fail "No fue posible obtener la cuenta AWS. Revisa las credenciales."
-fi
-
-echo "Credenciales AWS válidas."
-echo "Cuenta AWS: $ACCOUNT_ID"
-echo "Identidad:  $IDENTITY_ARN"
-
-#####################################
-# 1. DESCUBRIR LA VPC
-#####################################
-echo ""
-echo "1. Buscando la VPC del proyecto..."
-
-VPC_ID=$(aws ec2 describe-vpcs \
-  --region "$REGION" \
-  --filters \
-    "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-vpc" \
-    "Name=tag:Project,Values=${NETWORK_PROJECT_NAME}" \
-  --query "Vpcs[0].VpcId" \
-  --output text \
-  --no-cli-pager)
-
-if resource_not_found "$VPC_ID"; then
-  VPC_ID=$(aws ec2 describe-vpcs \
+  vpc_id=$(aws ec2 describe-vpcs \
     --region "$REGION" \
     --filters \
       "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-vpc" \
-    --query "Vpcs[0].VpcId" \
+      "Name=tag:Project,Values=${NETWORK_PROJECT_NAME}" \
+    --query 'Vpcs[0].VpcId' \
     --output text \
     --no-cli-pager)
-fi
 
-if resource_not_found "$VPC_ID"; then
-  fail "No se encontró ${NETWORK_PROJECT_NAME}-vpc. Ejecuta primero crear-red-lab.sh."
-fi
+  if is_empty_aws_value "$vpc_id"; then
+    vpc_id=$(aws ec2 describe-vpcs \
+      --region "$REGION" \
+      --filters "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-vpc" \
+      --query 'Vpcs[0].VpcId' \
+      --output text \
+      --no-cli-pager)
+  fi
 
-VPC_STATE=$(aws ec2 describe-vpcs \
-  --region "$REGION" \
-  --vpc-ids "$VPC_ID" \
-  --query "Vpcs[0].State" \
-  --output text \
-  --no-cli-pager)
+  is_empty_aws_value "$vpc_id" &&
+    fail "No se encontró ${NETWORK_PROJECT_NAME}-vpc. Ejecuta primero el workflow de red."
 
-if [ "$VPC_STATE" != "available" ]; then
-  fail "La VPC $VPC_ID no está disponible. Estado: $VPC_STATE"
-fi
+  printf '%s\n' "$vpc_id"
+}
 
-echo "VPC encontrada: $VPC_ID"
+find_subnet() {
+  local vpc_id="$1"
+  local subnet_name="$2"
+  local subnet_id
 
-#####################################
-# 2. DESCUBRIR SUBREDES APP
-#####################################
-echo ""
-echo "2. Buscando subredes privadas APP..."
+  subnet_id=$(aws ec2 describe-subnets \
+    --region "$REGION" \
+    --filters \
+      "Name=vpc-id,Values=$vpc_id" \
+      "Name=tag:Name,Values=$subnet_name" \
+    --query 'Subnets[0].SubnetId' \
+    --output text \
+    --no-cli-pager)
 
-APP_SUBNET_A=$(aws ec2 describe-subnets \
-  --region "$REGION" \
-  --filters \
-    "Name=vpc-id,Values=$VPC_ID" \
-    "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-app-a" \
-  --query "Subnets[0].SubnetId" \
-  --output text \
-  --no-cli-pager)
+  is_empty_aws_value "$subnet_id" && fail "No se encontró la subred '$subnet_name'."
+  printf '%s\n' "$subnet_id"
+}
 
-APP_SUBNET_B=$(aws ec2 describe-subnets \
-  --region "$REGION" \
-  --filters \
-    "Name=vpc-id,Values=$VPC_ID" \
-    "Name=tag:Name,Values=${NETWORK_PROJECT_NAME}-app-b" \
-  --query "Subnets[0].SubnetId" \
-  --output text \
-  --no-cli-pager)
+find_route_table_for_subnet() {
+  local vpc_id="$1"
+  local subnet_id="$2"
+  local route_table_id
 
-if resource_not_found "$APP_SUBNET_A"; then
-  fail "No se encontró ${NETWORK_PROJECT_NAME}-app-a."
-fi
-
-if resource_not_found "$APP_SUBNET_B"; then
-  fail "No se encontró ${NETWORK_PROJECT_NAME}-app-b."
-fi
-
-APP_A_AZ=$(aws ec2 describe-subnets \
-  --region "$REGION" \
-  --subnet-ids "$APP_SUBNET_A" \
-  --query "Subnets[0].AvailabilityZone" \
-  --output text \
-  --no-cli-pager)
-
-APP_B_AZ=$(aws ec2 describe-subnets \
-  --region "$REGION" \
-  --subnet-ids "$APP_SUBNET_B" \
-  --query "Subnets[0].AvailabilityZone" \
-  --output text \
-  --no-cli-pager)
-
-if [ "$APP_A_AZ" = "$APP_B_AZ" ]; then
-  fail "Las subredes APP deben estar en zonas de disponibilidad diferentes."
-fi
-
-APP_A_PUBLIC_IP=$(aws ec2 describe-subnets \
-  --region "$REGION" \
-  --subnet-ids "$APP_SUBNET_A" \
-  --query "Subnets[0].MapPublicIpOnLaunch" \
-  --output text \
-  --no-cli-pager)
-
-APP_B_PUBLIC_IP=$(aws ec2 describe-subnets \
-  --region "$REGION" \
-  --subnet-ids "$APP_SUBNET_B" \
-  --query "Subnets[0].MapPublicIpOnLaunch" \
-  --output text \
-  --no-cli-pager)
-
-if [ "$APP_A_PUBLIC_IP" != "False" ] ||
-  [ "$APP_B_PUBLIC_IP" != "False" ]; then
-  fail "Las subredes APP deben tener deshabilitada la asignación automática de IP pública."
-fi
-
-echo "Subred APP A: $APP_SUBNET_A ($APP_A_AZ)"
-echo "Subred APP B: $APP_SUBNET_B ($APP_B_AZ)"
-
-#####################################
-# 3. VALIDAR RUTAS PRIVADAS
-#####################################
-echo ""
-echo "3. Validando salida mediante NAT Gateway..."
-
-for subnet_id in "$APP_SUBNET_A" "$APP_SUBNET_B"; do
-  ROUTE_TARGET=$(aws ec2 describe-route-tables \
+  route_table_id=$(aws ec2 describe-route-tables \
     --region "$REGION" \
     --filters "Name=association.subnet-id,Values=$subnet_id" \
-    --query \
-      "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].NatGatewayId | [0]" \
+    --query 'RouteTables[0].RouteTableId' \
     --output text \
     --no-cli-pager)
 
-  if resource_not_found "$ROUTE_TARGET"; then
-    fail "La subred $subnet_id no tiene una ruta hacia un NAT Gateway."
+  if is_empty_aws_value "$route_table_id"; then
+    route_table_id=$(aws ec2 describe-route-tables \
+      --region "$REGION" \
+      --filters \
+        "Name=vpc-id,Values=$vpc_id" \
+        'Name=association.main,Values=true' \
+      --query 'RouteTables[0].RouteTableId' \
+      --output text \
+      --no-cli-pager)
   fi
 
-  NAT_STATE=$(aws ec2 describe-nat-gateways \
+  is_empty_aws_value "$route_table_id" &&
+    fail "No se encontró una Route Table efectiva para la subred $subnet_id."
+
+  printf '%s\n' "$route_table_id"
+}
+
+validate_private_subnet() {
+  local subnet_id="$1"
+  local expected_az_distinct_from="${2:-}"
+  local map_public_ip az
+
+  read -r map_public_ip az < <(aws ec2 describe-subnets \
     --region "$REGION" \
-    --nat-gateway-ids "$ROUTE_TARGET" \
-    --query "NatGateways[0].State" \
+    --subnet-ids "$subnet_id" \
+    --query 'Subnets[0].[MapPublicIpOnLaunch,AvailabilityZone]' \
     --output text \
     --no-cli-pager)
 
-  if [ "$NAT_STATE" != "available" ]; then
-    fail "El NAT Gateway $ROUTE_TARGET no está disponible. Estado: $NAT_STATE"
+  [[ "$map_public_ip" == "False" ]] ||
+    fail "La subred $subnet_id asigna IP pública automáticamente y no es privada."
+
+  if [[ -n "$expected_az_distinct_from" && "$az" == "$expected_az_distinct_from" ]]; then
+    fail "Las subredes APP deben estar en zonas de disponibilidad distintas."
   fi
 
-  echo "Subred $subnet_id → NAT Gateway $ROUTE_TARGET"
-done
+  printf '%s\n' "$az"
+}
 
-#####################################
-# 4. DESCUBRIR ROLES IAM DE EKS
-#####################################
-echo ""
-echo "4. Buscando roles IAM de Amazon EKS..."
+validate_nat_route() {
+  local vpc_id="$1"
+  local subnet_id="$2"
+  local route_table_id nat_gateway_id nat_state
 
-CLUSTER_ROLE_ARN="${EKS_CLUSTER_ROLE_ARN:-}"
-NODE_ROLE_ARN="${EKS_NODE_ROLE_ARN:-}"
+  route_table_id=$(find_route_table_for_subnet "$vpc_id" "$subnet_id")
 
-if resource_not_found "$CLUSTER_ROLE_ARN"; then
-  CLUSTER_ROLE_ARN=$(aws iam list-roles \
-    --query \
-      "Roles[?contains(RoleName, 'LabEksClusterRole')].Arn | [0]" \
-    --output text \
-    --no-cli-pager)
-fi
-
-if resource_not_found "$NODE_ROLE_ARN"; then
-  NODE_ROLE_ARN=$(aws iam list-roles \
-    --query \
-      "Roles[?contains(RoleName, 'LabEksNodeRole')].Arn | [0]" \
-    --output text \
-    --no-cli-pager)
-fi
-
-if resource_not_found "$CLUSTER_ROLE_ARN"; then
-  fail "No se encontró un rol LabEksClusterRole."
-fi
-
-if resource_not_found "$NODE_ROLE_ARN"; then
-  fail "No se encontró un rol LabEksNodeRole."
-fi
-
-CLUSTER_ROLE_NAME="${CLUSTER_ROLE_ARN##*/}"
-NODE_ROLE_NAME="${NODE_ROLE_ARN##*/}"
-
-CLUSTER_TRUST=$(aws iam get-role \
-  --role-name "$CLUSTER_ROLE_NAME" \
-  --query \
-    "Role.AssumeRolePolicyDocument.Statement[?Principal.Service=='eks.amazonaws.com'] | length(@)" \
-  --output text \
-  --no-cli-pager)
-
-NODE_TRUST=$(aws iam get-role \
-  --role-name "$NODE_ROLE_NAME" \
-  --query \
-    "Role.AssumeRolePolicyDocument.Statement[?Principal.Service=='ec2.amazonaws.com'] | length(@)" \
-  --output text \
-  --no-cli-pager)
-
-if [ "$CLUSTER_TRUST" = "0" ]; then
-  fail "El rol $CLUSTER_ROLE_NAME no confía en eks.amazonaws.com."
-fi
-
-if [ "$NODE_TRUST" = "0" ]; then
-  fail "El rol $NODE_ROLE_NAME no confía en ec2.amazonaws.com."
-fi
-
-echo "Rol del clúster: $CLUSTER_ROLE_ARN"
-echo "Rol de los nodos: $NODE_ROLE_ARN"
-
-#####################################
-# 5. REPOSITORIOS ECR
-#####################################
-echo ""
-echo "5. Repositorios Amazon ECR..."
-
-for repository in "${ECR_REPOSITORIES[@]}"; do
-  if aws ecr describe-repositories \
+  nat_gateway_id=$(aws ec2 describe-route-tables \
     --region "$REGION" \
-    --repository-names "$repository" \
-    --no-cli-pager \
-    >/dev/null 2>&1; then
+    --route-table-ids "$route_table_id" \
+    --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].NatGatewayId | [0]" \
+    --output text \
+    --no-cli-pager)
 
-    echo "Repositorio existente: $repository"
-  else
+  is_empty_aws_value "$nat_gateway_id" &&
+    fail "La subred $subnet_id no tiene una ruta 0.0.0.0/0 hacia un NAT Gateway."
+
+  nat_state=$(aws ec2 describe-nat-gateways \
+    --region "$REGION" \
+    --nat-gateway-ids "$nat_gateway_id" \
+    --query 'NatGateways[0].State' \
+    --output text \
+    --no-cli-pager)
+
+  [[ "$nat_state" == "available" ]] ||
+    fail "El NAT Gateway $nat_gateway_id está en estado $nat_state."
+
+  log_ok "Subred $subnet_id → Route Table $route_table_id → NAT $nat_gateway_id"
+}
+
+#######################################
+# IAM EXISTENTE DE AWS ACADEMY
+#######################################
+resolve_role_arn() {
+  local supplied_arn="$1"
+  local role_name="$2"
+  local role_arn rc
+
+  if [[ -n "$supplied_arn" ]]; then
+    printf '%s\n' "$supplied_arn"
+    return 0
+  fi
+
+  if role_arn=$(get_role_arn "$role_name"); then
+    printf '%s\n' "$role_arn"
+    return 0
+  fi
+
+  rc=$?
+  [[ "$rc" -eq 4 ]] && fail "No se encontró el rol IAM '$role_name' proporcionado por AWS Academy."
+  return "$rc"
+}
+
+validate_role_trust() {
+  local role_arn="$1"
+  local expected_service="$2"
+  local role_name trust_count
+  role_name="${role_arn##*/}"
+
+  trust_count=$(aws iam get-role \
+    --role-name "$role_name" \
+    --query "Role.AssumeRolePolicyDocument.Statement[?Principal.Service=='${expected_service}'] | length(@)" \
+    --output text \
+    --no-cli-pager)
+
+  [[ "$trust_count" != "0" ]] ||
+    fail "El rol $role_name no confía en $expected_service."
+}
+
+#######################################
+# ECR
+#######################################
+ensure_ecr_repositories() {
+  local repository rc
+
+  for repository in "${ECR_REPOSITORIES[@]}"; do
+    if repository_exists "$repository"; then
+      log_ok "Repositorio existente: $repository"
+      continue
+    fi
+
+    rc=$?
+    [[ "$rc" -eq 4 ]] || return "$rc"
+
     aws ecr create-repository \
       --region "$REGION" \
       --repository-name "$repository" \
       --image-tag-mutability MUTABLE \
       --image-scanning-configuration scanOnPush=true \
       --tags \
-        Key=Project,Value=tienda \
-        Key=Environment,Value=academic \
+        "Key=Project,Value=$PROJECT_NAME" \
+        "Key=Environment,Value=$ENVIRONMENT" \
+        'Key=ManagedBy,Value=crear-eks.sh' \
       --no-cli-pager \
       >/dev/null
 
-    echo "Repositorio creado: $repository"
-  fi
-done
-
-#####################################
-# 6. CREAR CLÚSTER EKS
-#####################################
-echo ""
-echo "6. Clúster Amazon EKS..."
-
-CLUSTER_STATUS=$(get_cluster_status)
-
-if resource_not_found "$CLUSTER_STATUS"; then
-  echo "Creando clúster $CLUSTER_NAME..."
-
-  aws eks create-cluster \
-    --region "$REGION" \
-    --name "$CLUSTER_NAME" \
-    --version "$KUBERNETES_VERSION" \
-    --role-arn "$CLUSTER_ROLE_ARN" \
-    --resources-vpc-config \
-      "subnetIds=${APP_SUBNET_A},${APP_SUBNET_B},endpointPublicAccess=true,endpointPrivateAccess=true" \
-    --kubernetes-network-config "ipFamily=ipv4" \
-    --logging \
-      '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
-    --tags \
-      Project=tienda \
-      Environment=academic \
-      ManagedBy=crear-eks.sh \
-    --no-cli-pager \
-    >/dev/null
-
-  echo "Solicitud de creación enviada."
-
-  wait_for_cluster_active
-  CLUSTER_STATUS=$(get_cluster_status)
-else
-  echo "El clúster ya existe."
-  echo "Estado actual: $CLUSTER_STATUS"
-fi
-
-case "$CLUSTER_STATUS" in
-  ACTIVE)
-    echo "El clúster ya está activo."
-    ;;
-
-  CREATING | UPDATING)
-    echo "Esperando que el clúster quede ACTIVE..."
-
-   wait_for_cluster_active
-
-    echo "Clúster activo."
-    ;;
-
-  FAILED | DELETING)
-    fail "El clúster está en estado $CLUSTER_STATUS."
-    ;;
-
-  *)
-    fail "Estado inesperado del clúster: $CLUSTER_STATUS"
-    ;;
-esac
-
-CLUSTER_STATUS=$(get_cluster_status)
-
-if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
-  fail "El clúster no quedó activo. Estado: $CLUSTER_STATUS"
-fi
-
-ACTUAL_KUBERNETES_VERSION=$(aws eks describe-cluster \
-  --region "$REGION" \
-  --name "$CLUSTER_NAME" \
-  --query "cluster.version" \
-  --output text \
-  --no-cli-pager)
-
-#####################################
-# 7. LOGS DEL CONTROL PLANE
-#####################################
-echo ""
-echo "7. Configurando logs del plano de control..."
-
-LOGGING_ENABLED=$(aws eks describe-cluster \
-  --region "$REGION" \
-  --name "$CLUSTER_NAME" \
-  --query \
-    "cluster.logging.clusterLogging[?enabled==\`true\`].types[]" \
-  --output text \
-  --no-cli-pager)
-
-MISSING_CONTROL_PLANE_LOGS=false
-
-for log_type in "${CONTROL_PLANE_LOG_TYPES[@]}"; do
-  if [[ " $LOGGING_ENABLED " != *" $log_type "* ]]; then
-    MISSING_CONTROL_PLANE_LOGS=true
-    break
-  fi
-done
-
-if [ "$MISSING_CONTROL_PLANE_LOGS" = "true" ]; then
-  aws eks update-cluster-config \
-    --region "$REGION" \
-    --name "$CLUSTER_NAME" \
-    --logging \
-      '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
-    --no-cli-pager \
-    >/dev/null
-
-  echo "Actualización de logging enviada."
-
-  wait_for_cluster_active 
-
-else
-  echo "Los logs del plano de control ya están habilitados."
-fi
-
-#####################################
-# 8. CONFIGURAR KUBECONFIG
-#####################################
-echo ""
-echo "8. Configurando kubeconfig..."
-
-aws eks update-kubeconfig \
-  --region "$REGION" \
-  --name "$CLUSTER_NAME" \
-  --alias "$CLUSTER_NAME" \
-  --no-cli-pager
-
-echo "Kubeconfig actualizado."
-
-#####################################
-# 9. CREAR MANAGED NODE GROUP
-#####################################
-echo ""
-echo "9. Managed Node Group..."
-
-NODEGROUP_STATUS=$(get_nodegroup_status)
-
-if resource_not_found "$NODEGROUP_STATUS"; then
-  echo "Creando Node Group $NODEGROUP_NAME..."
-
-  aws eks create-nodegroup \
-    --region "$REGION" \
-    --cluster-name "$CLUSTER_NAME" \
-    --nodegroup-name "$NODEGROUP_NAME" \
-    --node-role "$NODE_ROLE_ARN" \
-    --subnets "$APP_SUBNET_A" "$APP_SUBNET_B" \
-    --instance-types "$NODE_INSTANCE_TYPE" \
-    --capacity-type ON_DEMAND \
-    --disk-size "$NODE_DISK_SIZE" \
-    --scaling-config \
-      "minSize=${NODE_MIN_SIZE},maxSize=${NODE_MAX_SIZE},desiredSize=${NODE_DESIRED_SIZE}" \
-    --update-config "maxUnavailable=1" \
-    --labels \
-      "workload=tienda,environment=academic" \
-    --tags \
-      Project=tienda \
-      Environment=academic \
-      ManagedBy=crear-eks.sh \
-    --no-cli-pager \
-    >/dev/null
-
-  echo "Solicitud de creación enviada."
-
-  wait_for_nodegroup_visibility
-  NODEGROUP_STATUS=$(get_nodegroup_status)
-else
-  echo "El Node Group ya existe."
-  echo "Estado actual: $NODEGROUP_STATUS"
-fi
-
-case "$NODEGROUP_STATUS" in
-  ACTIVE)
-    echo "El Node Group ya está activo."
-    ;;
-
-  CREATING | UPDATING)
-    echo "Esperando que el Node Group quede ACTIVE..."
-
-    aws eks wait nodegroup-active \
-      --region "$REGION" \
-      --cluster-name "$CLUSTER_NAME" \
-      --nodegroup-name "$NODEGROUP_NAME"
-
-    echo "Node Group activo."
-    ;;
-
-  CREATE_FAILED | DELETE_FAILED | DEGRADED | DELETING)
-    fail "El Node Group está en estado $NODEGROUP_STATUS."
-    ;;
-
-  *)
-    fail "Estado inesperado del Node Group: $NODEGROUP_STATUS"
-    ;;
-esac
-
-NODEGROUP_STATUS=$(get_nodegroup_status)
-
-if [ "$NODEGROUP_STATUS" != "ACTIVE" ]; then
-  fail "El Node Group no quedó activo. Estado: $NODEGROUP_STATUS"
-fi
-
-#####################################
-# 10. EKS POD IDENTITY AGENT
-#####################################
-if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-  echo ""
-  echo "10. Instalando EKS Pod Identity Agent..."
-
-  create_or_update_addon "eks-pod-identity-agent"
-
-  if command_exists kubectl; then
-    kubectl rollout status \
-      daemonset/eks-pod-identity-agent \
-      --namespace kube-system \
-      --timeout=300s
-  fi
-else
-  echo ""
-  echo "10. CloudWatch deshabilitado."
-fi
-
-#####################################
-# 11. ROL IAM PARA CLOUDWATCH
-#####################################
-if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-  echo ""
-  echo "11. Configurando rol IAM para CloudWatch..."
-
-  if resource_not_found "$CLOUDWATCH_ROLE_ARN"; then
-    EXISTING_CLOUDWATCH_ROLE_ARN=$(aws iam get-role \
-      --role-name "$CLOUDWATCH_ROLE_NAME" \
-      --query "Role.Arn" \
-      --output text \
-      --no-cli-pager \
-      2>/dev/null || true)
-
-    if resource_not_found "$EXISTING_CLOUDWATCH_ROLE_ARN"; then
-      TRUST_POLICY_FILE=$(mktemp)
-
-      cat > "$TRUST_POLICY_FILE" <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "pods.eks.amazonaws.com"
-      },
-      "Action": [
-        "sts:AssumeRole",
-        "sts:TagSession"
-      ]
-    }
-  ]
+    log_ok "Repositorio creado: $repository"
+  done
 }
-EOF
 
-      if ! CLOUDWATCH_ROLE_ARN=$(aws iam create-role \
-        --role-name "$CLOUDWATCH_ROLE_NAME" \
-        --assume-role-policy-document "file://${TRUST_POLICY_FILE}" \
-        --description "Rol Pod Identity para CloudWatch Observability en ${CLUSTER_NAME}" \
-        --tags \
-          Key=Project,Value=tienda \
-          Key=Environment,Value=academic \
-          Key=ManagedBy,Value=crear-eks.sh \
-        --query "Role.Arn" \
-        --output text \
-        --no-cli-pager); then
+#######################################
+# EKS
+#######################################
+ensure_cluster() {
+  local cluster_role_arn="$1"
+  local subnet_a="$2"
+  local subnet_b="$3"
+  local status rc actual_version
 
-        rm -f "$TRUST_POLICY_FILE"
-
-        fail "AWS Academy no permitió crear $CLOUDWATCH_ROLE_NAME. Proporciona CLOUDWATCH_ROLE_ARN."
-      fi
-
-      rm -f "$TRUST_POLICY_FILE"
-      echo "Rol CloudWatch creado: $CLOUDWATCH_ROLE_ARN"
-    else
-      CLOUDWATCH_ROLE_ARN="$EXISTING_CLOUDWATCH_ROLE_ARN"
-      echo "Rol CloudWatch existente: $CLOUDWATCH_ROLE_ARN"
-    fi
+  if status=$(get_cluster_status); then
+    log_ok "El clúster ya existe. Estado: $status"
   else
-    echo "Usando rol CloudWatch proporcionado: $CLOUDWATCH_ROLE_ARN"
+    rc=$?
+    [[ "$rc" -eq 4 ]] || return "$rc"
+
+    log_info "Creando clúster $CLUSTER_NAME..."
+
+    aws eks create-cluster \
+      --region "$REGION" \
+      --name "$CLUSTER_NAME" \
+      --version "$KUBERNETES_VERSION" \
+      --role-arn "$cluster_role_arn" \
+      --resources-vpc-config \
+        "subnetIds=${subnet_a},${subnet_b},endpointPublicAccess=true,endpointPrivateAccess=true" \
+      --kubernetes-network-config 'ipFamily=ipv4' \
+      --logging \
+        '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
+      --tags \
+        "Project=$PROJECT_NAME" \
+        "Environment=$ENVIRONMENT" \
+        'ManagedBy=crear-eks.sh' \
+      --client-request-token "${CLUSTER_NAME}-create-v1" \
+      --no-cli-pager \
+      >/dev/null
+
+    log_ok "AWS aceptó la solicitud create-cluster."
+    wait_for_cluster_active
+    status="ACTIVE"
   fi
 
-  CLOUDWATCH_ROLE_NAME="${CLOUDWATCH_ROLE_ARN##*/}"
+  case "$status" in
+    ACTIVE) ;;
+    CREATING | UPDATING | PENDING) wait_for_cluster_active ;;
+    FAILED | DELETING)
+      show_cluster_health_issues
+      fail "El clúster está en estado $status."
+      ;;
+    *) fail "Estado inesperado del clúster: $status" ;;
+  esac
 
-  CLOUDWATCH_TRUST=$(aws iam get-role \
-    --role-name "$CLOUDWATCH_ROLE_NAME" \
-    --query \
-      "Role.AssumeRolePolicyDocument.Statement[?Principal.Service=='pods.eks.amazonaws.com'] | length(@)" \
+  actual_version=$(aws eks describe-cluster \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --query 'cluster.version' \
     --output text \
     --no-cli-pager)
 
-  if [ "$CLOUDWATCH_TRUST" = "0" ]; then
-    fail "El rol $CLOUDWATCH_ROLE_NAME no confía en pods.eks.amazonaws.com."
+  if [[ "$actual_version" != "$KUBERNETES_VERSION" ]]; then
+    log_warn "El clúster existente usa Kubernetes $actual_version; el script solicita $KUBERNETES_VERSION. No se hará upgrade automático."
+  fi
+}
+
+ensure_control_plane_logs() {
+  local enabled_logs missing=false log_type update_id
+
+  enabled_logs=$(aws eks describe-cluster \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --query 'cluster.logging.clusterLogging[?enabled==`true`].types[]' \
+    --output text \
+    --no-cli-pager)
+
+  for log_type in "${CONTROL_PLANE_LOG_TYPES[@]}"; do
+    if [[ " $enabled_logs " != *" $log_type "* ]]; then
+      missing=true
+      break
+    fi
+  done
+
+  if [[ "$missing" == "false" ]]; then
+    log_ok "Los logs del plano de control ya están habilitados."
+    return 0
   fi
 
-  aws iam attach-role-policy \
-    --role-name "$CLOUDWATCH_ROLE_NAME" \
-    --policy-arn "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy" \
-    --no-cli-pager
+  update_id=$(aws eks update-cluster-config \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --logging \
+      '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
+    --query 'update.id' \
+    --output text \
+    --no-cli-pager)
 
-  echo "Política CloudWatchAgentServerPolicy asociada."
-fi
+  wait_for_cluster_update "$update_id"
+}
 
-#####################################
-# 12. POD IDENTITY ASSOCIATION
-#####################################
-if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-  echo ""
-  echo "12. Configurando Pod Identity para CloudWatch..."
+ensure_nodegroup() {
+  local node_role_arn="$1"
+  local subnet_a="$2"
+  local subnet_b="$3"
+  local status rc
 
-  POD_IDENTITY_ASSOCIATION_ID=$(aws eks list-pod-identity-associations \
+  if status=$(get_nodegroup_status); then
+    log_ok "El Node Group ya existe. Estado: $status"
+  else
+    rc=$?
+    [[ "$rc" -eq 4 ]] || return "$rc"
+
+    log_info "Creando Managed Node Group $NODEGROUP_NAME..."
+
+    aws eks create-nodegroup \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER_NAME" \
+      --nodegroup-name "$NODEGROUP_NAME" \
+      --node-role "$node_role_arn" \
+      --subnets "$subnet_a" "$subnet_b" \
+      --instance-types "$NODE_INSTANCE_TYPE" \
+      --capacity-type ON_DEMAND \
+      --disk-size "$NODE_DISK_SIZE" \
+      --scaling-config \
+        "minSize=${NODE_MIN_SIZE},maxSize=${NODE_MAX_SIZE},desiredSize=${NODE_DESIRED_SIZE}" \
+      --update-config 'maxUnavailable=1' \
+      --labels \
+        "workload=$PROJECT_NAME,environment=$ENVIRONMENT" \
+      --tags \
+        "Project=$PROJECT_NAME" \
+        "Environment=$ENVIRONMENT" \
+        'ManagedBy=crear-eks.sh' \
+      --client-request-token "${CLUSTER_NAME}-${NODEGROUP_NAME}-create-v1" \
+      --no-cli-pager \
+      >/dev/null
+
+    log_ok "AWS aceptó la solicitud create-nodegroup."
+    wait_for_nodegroup_active
+    return 0
+  fi
+
+  case "$status" in
+    ACTIVE) ;;
+    CREATING | UPDATING) wait_for_nodegroup_active ;;
+    CREATE_FAILED | DELETE_FAILED | DEGRADED | DELETING)
+      show_nodegroup_health_issues
+      fail "El Node Group está en estado $status."
+      ;;
+    *) fail "Estado inesperado del Node Group: $status" ;;
+  esac
+}
+
+#######################################
+# ADD-ONS
+#######################################
+ensure_addon() {
+  local addon_name="$1"
+  local status rc
+
+  if status=$(get_addon_status "$addon_name"); then
+    case "$status" in
+      ACTIVE)
+        log_ok "Add-on existente y activo: $addon_name"
+        return 0
+        ;;
+      CREATING | UPDATING)
+        wait_for_addon_active "$addon_name"
+        return 0
+        ;;
+      CREATE_FAILED | UPDATE_FAILED | DELETE_FAILED | DEGRADED)
+        show_addon_health_issues "$addon_name"
+        fail "El add-on existente '$addon_name' está en estado $status."
+        ;;
+      *) fail "Estado inesperado del add-on '$addon_name': $status" ;;
+    esac
+  fi
+
+  rc=$?
+  [[ "$rc" -eq 4 ]] || return "$rc"
+
+  log_info "Instalando add-on: $addon_name"
+  aws eks create-addon \
     --region "$REGION" \
     --cluster-name "$CLUSTER_NAME" \
-    --query \
-      "associations[?namespace=='amazon-cloudwatch' && serviceAccount=='cloudwatch-agent'].associationId | [0]" \
+    --addon-name "$addon_name" \
+    --resolve-conflicts OVERWRITE \
+    --client-request-token "${CLUSTER_NAME}-${addon_name}-create-v1" \
+    --no-cli-pager \
+    >/dev/null
+
+  wait_for_addon_active "$addon_name"
+}
+
+resolve_cloudwatch_role_arn() {
+  local role_arn rc
+
+  if [[ -n "$CLOUDWATCH_ROLE_ARN_INPUT" ]]; then
+    printf '%s\n' "$CLOUDWATCH_ROLE_ARN_INPUT"
+    return 0
+  fi
+
+  if role_arn=$(get_role_arn "$CLOUDWATCH_ROLE_NAME"); then
+    printf '%s\n' "$role_arn"
+    return 0
+  fi
+
+  rc=$?
+  [[ "$rc" -eq 4 ]] && return 4
+  return "$rc"
+}
+
+ensure_cloudwatch_observability() {
+  local cloudwatch_role_arn association_id current_role_arn rc
+
+  if [[ "$CLOUDWATCH_ENABLED" != "true" ]]; then
+    log_warn "CloudWatch Observability está deshabilitado."
+    return 0
+  fi
+
+  ensure_addon 'eks-pod-identity-agent'
+
+  if cloudwatch_role_arn=$(resolve_cloudwatch_role_arn); then
+    :
+  else
+    rc=$?
+    if [[ "$rc" -eq 4 ]]; then
+      log_warn "AWS Academy no proporciona el rol '$CLOUDWATCH_ROLE_NAME' y este script no crea IAM Roles."
+      log_warn "Se instaló eks-pod-identity-agent, pero se omitirá amazon-cloudwatch-observability."
+      log_warn "Para habilitarlo, define el secret o variable CLOUDWATCH_ROLE_ARN con un rol autorizado que tenga CloudWatchAgentServerPolicy."
+      return 0
+    fi
+    return "$rc"
+  fi
+
+  validate_role_trust "$cloudwatch_role_arn" 'pods.eks.amazonaws.com'
+
+  association_id=$(aws eks list-pod-identity-associations \
+    --region "$REGION" \
+    --cluster-name "$CLUSTER_NAME" \
+    --query "associations[?namespace=='amazon-cloudwatch' && serviceAccount=='cloudwatch-agent'].associationId | [0]" \
     --output text \
     --no-cli-pager)
 
-  if resource_not_found "$POD_IDENTITY_ASSOCIATION_ID"; then
-    POD_IDENTITY_ASSOCIATION_ID=$(aws eks create-pod-identity-association \
+  if is_empty_aws_value "$association_id"; then
+    association_id=$(aws eks create-pod-identity-association \
       --region "$REGION" \
       --cluster-name "$CLUSTER_NAME" \
-      --namespace "amazon-cloudwatch" \
-      --service-account "cloudwatch-agent" \
-      --role-arn "$CLOUDWATCH_ROLE_ARN" \
+      --namespace amazon-cloudwatch \
+      --service-account cloudwatch-agent \
+      --role-arn "$cloudwatch_role_arn" \
       --tags \
-        Project=tienda \
-        Environment=academic \
-        ManagedBy=crear-eks.sh \
-      --query "association.associationId" \
+        "Project=$PROJECT_NAME" \
+        "Environment=$ENVIRONMENT" \
+        'ManagedBy=crear-eks.sh' \
+      --query 'association.associationId' \
       --output text \
       --no-cli-pager)
 
-    echo "Pod Identity Association creada: $POD_IDENTITY_ASSOCIATION_ID"
+    log_ok "Pod Identity Association creada: $association_id"
   else
-    CURRENT_CLOUDWATCH_ROLE_ARN=$(aws eks describe-pod-identity-association \
+    current_role_arn=$(aws eks describe-pod-identity-association \
       --region "$REGION" \
       --cluster-name "$CLUSTER_NAME" \
-      --association-id "$POD_IDENTITY_ASSOCIATION_ID" \
-      --query "association.roleArn" \
+      --association-id "$association_id" \
+      --query 'association.roleArn' \
       --output text \
       --no-cli-pager)
 
-    if [ "$CURRENT_CLOUDWATCH_ROLE_ARN" != "$CLOUDWATCH_ROLE_ARN" ]; then
+    if [[ "$current_role_arn" != "$cloudwatch_role_arn" ]]; then
       aws eks update-pod-identity-association \
         --region "$REGION" \
         --cluster-name "$CLUSTER_NAME" \
-        --association-id "$POD_IDENTITY_ASSOCIATION_ID" \
-        --role-arn "$CLOUDWATCH_ROLE_ARN" \
+        --association-id "$association_id" \
+        --role-arn "$cloudwatch_role_arn" \
         --no-cli-pager \
         >/dev/null
-
-      echo "Pod Identity Association actualizada."
+      log_ok "Pod Identity Association actualizada."
     else
-      echo "Pod Identity Association ya configurada."
+      log_ok "Pod Identity Association ya configurada."
     fi
   fi
-fi
 
-#####################################
-# 13. CLOUDWATCH OBSERVABILITY ADD-ON
-#####################################
-if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-  echo ""
-  echo "13. Instalando CloudWatch Observability..."
+  ensure_addon 'amazon-cloudwatch-observability'
+}
 
-  CLOUDWATCH_CONFIGURATION='{"otelContainerInsights":{"enabled":true}}'
+#######################################
+# KUBECONFIG Y VERIFICACIÓN
+#######################################
+configure_kubeconfig() {
+  require_command kubectl
 
-  create_or_update_addon \
-    "amazon-cloudwatch-observability" \
-    "$CLOUDWATCH_CONFIGURATION"
+  aws eks update-kubeconfig \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --alias "$CLUSTER_NAME" \
+    --no-cli-pager
 
-  echo "CloudWatch Container Insights habilitado."
-fi
-
-#####################################
-# 14. VERIFICAR KUBERNETES
-#####################################
-echo ""
-echo "14. Verificando Kubernetes..."
-
-if command_exists kubectl; then
   kubectl config use-context "$CLUSTER_NAME" >/dev/null
+  log_ok "Kubeconfig actualizado y contexto seleccionado."
+}
 
-  echo ""
+verify_kubernetes() {
+  local ready_node_count
+
   kubectl get nodes -o wide
 
-  READY_NODE_COUNT=$(kubectl get nodes \
-    --no-headers \
-    2>/dev/null |
-    awk '$2 == "Ready" {count++} END {print count+0}')
+  ready_node_count=$(kubectl get nodes \
+    --no-headers | awk '$2 == "Ready" {count++} END {print count+0}')
 
-  echo ""
-  echo "Nodos Ready: $READY_NODE_COUNT"
+  [[ "$ready_node_count" -ge "$NODE_MIN_SIZE" ]] ||
+    fail "Solo hay $ready_node_count nodos Ready; se esperaban al menos $NODE_MIN_SIZE."
 
-  if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-    echo ""
-    echo "Pods de EKS Pod Identity:"
-    kubectl get pods \
-      --namespace kube-system \
-      -l app.kubernetes.io/name=eks-pod-identity-agent \
-      -o wide || true
+  log_ok "Nodos Ready: $ready_node_count"
+}
 
-    echo ""
-    echo "Pods de CloudWatch:"
-    kubectl get pods \
-      --namespace amazon-cloudwatch \
-      -o wide
-  fi
-else
-  warning "kubectl no está instalado. El kubeconfig quedó preparado."
-fi
+#######################################
+# VALIDACIONES INICIALES
+#######################################
+validate_inputs() {
+  require_command aws
+  require_command kubectl
 
-#####################################
-# 15. INFORMACIÓN FINAL
-#####################################
-echo ""
-echo "15. Obteniendo información final..."
+  validate_integer NODE_DISK_SIZE "$NODE_DISK_SIZE"
+  validate_integer NODE_MIN_SIZE "$NODE_MIN_SIZE"
+  validate_integer NODE_DESIRED_SIZE "$NODE_DESIRED_SIZE"
+  validate_integer NODE_MAX_SIZE "$NODE_MAX_SIZE"
+  validate_integer CLUSTER_WAIT_ATTEMPTS "$CLUSTER_WAIT_ATTEMPTS"
+  validate_integer NODEGROUP_WAIT_ATTEMPTS "$NODEGROUP_WAIT_ATTEMPTS"
+  validate_integer ADDON_WAIT_ATTEMPTS "$ADDON_WAIT_ATTEMPTS"
+  validate_integer POLL_INTERVAL_SECONDS "$POLL_INTERVAL_SECONDS"
+  validate_boolean CLOUDWATCH_ENABLED "$CLOUDWATCH_ENABLED"
 
-CLUSTER_ENDPOINT=$(aws eks describe-cluster \
-  --region "$REGION" \
-  --name "$CLUSTER_NAME" \
-  --query "cluster.endpoint" \
-  --output text \
-  --no-cli-pager)
+  ((NODE_MIN_SIZE <= NODE_DESIRED_SIZE)) ||
+    fail "NODE_MIN_SIZE no puede ser mayor que NODE_DESIRED_SIZE."
 
-CLUSTER_SECURITY_GROUP=$(aws eks describe-cluster \
-  --region "$REGION" \
-  --name "$CLUSTER_NAME" \
-  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" \
-  --output text \
-  --no-cli-pager)
+  ((NODE_DESIRED_SIZE <= NODE_MAX_SIZE)) ||
+    fail "NODE_DESIRED_SIZE no puede ser mayor que NODE_MAX_SIZE."
+}
 
-NODEGROUP_ASG=$(aws eks describe-nodegroup \
-  --region "$REGION" \
-  --cluster-name "$CLUSTER_NAME" \
-  --nodegroup-name "$NODEGROUP_NAME" \
-  --query "nodegroup.resources.autoScalingGroups[0].name" \
-  --output text \
-  --no-cli-pager)
-
-if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-  POD_IDENTITY_STATUS=$(get_addon_status "eks-pod-identity-agent")
-  CLOUDWATCH_STATUS=$(get_addon_status "amazon-cloudwatch-observability")
-else
-  POD_IDENTITY_STATUS="DISABLED"
-  CLOUDWATCH_STATUS="DISABLED"
-fi
-
-#####################################
+#######################################
 # RESUMEN
-#####################################
-echo ""
-echo "========================================"
-echo "AMAZON EKS LISTO"
-echo "========================================"
-echo "Cuenta AWS:             $ACCOUNT_ID"
-echo "Región:                 $REGION"
-echo ""
-echo "VPC:                    $VPC_ID"
-echo "Subred APP A:           $APP_SUBNET_A"
-echo "Subred APP B:           $APP_SUBNET_B"
-echo ""
-echo "Clúster EKS:            $CLUSTER_NAME"
-echo "Estado clúster:         $CLUSTER_STATUS"
-echo "Versión Kubernetes:     $ACTUAL_KUBERNETES_VERSION"
-echo "Endpoint:               $CLUSTER_ENDPOINT"
-echo "Security Group:         $CLUSTER_SECURITY_GROUP"
-echo ""
-echo "Node Group:             $NODEGROUP_NAME"
-echo "Estado Node Group:      $NODEGROUP_STATUS"
-echo "Tipo de instancia:      $NODE_INSTANCE_TYPE"
-echo "Escalamiento:           $NODE_MIN_SIZE/$NODE_DESIRED_SIZE/$NODE_MAX_SIZE"
-echo "Auto Scaling Group:     $NODEGROUP_ASG"
-echo ""
-echo "Observabilidad:"
-echo "  Control Plane Logs:   ENABLED"
-echo "  Pod Identity Agent:   $POD_IDENTITY_STATUS"
-echo "  CloudWatch Add-on:    $CLOUDWATCH_STATUS"
+#######################################
+print_summary() {
+  local account_id="$1"
+  local vpc_id="$2"
+  local subnet_a="$3"
+  local subnet_b="$4"
+  local cluster_status nodegroup_status actual_version endpoint cluster_sg nodegroup_asg
+  local pod_identity_status='NOT_INSTALLED'
+  local cloudwatch_status='NOT_INSTALLED'
+  local repository
 
-if [ "$CLOUDWATCH_ENABLED" = "true" ]; then
-  echo "  CloudWatch Role:      $CLOUDWATCH_ROLE_ARN"
-fi
+  cluster_status=$(get_cluster_status)
+  nodegroup_status=$(get_nodegroup_status)
 
-echo ""
-echo "Repositorios ECR:"
-for repository in "${ECR_REPOSITORIES[@]}"; do
-  echo "  ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${repository}"
-done
+  read -r actual_version endpoint cluster_sg < <(aws eks describe-cluster \
+    --region "$REGION" \
+    --name "$CLUSTER_NAME" \
+    --query 'cluster.[version,endpoint,resourcesVpcConfig.clusterSecurityGroupId]' \
+    --output text \
+    --no-cli-pager)
 
-echo ""
-echo "Comandos de verificación:"
-echo "  aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME"
-echo "  kubectl get nodes"
-echo "  kubectl get pods --all-namespaces"
-echo "  kubectl get pods -n amazon-cloudwatch"
-echo ""
-echo "CloudWatch:"
-echo "  AWS Console → CloudWatch → Container Insights"
-echo "  AWS Console → CloudWatch → Log groups"
-echo "========================================"
+  nodegroup_asg=$(aws eks describe-nodegroup \
+    --region "$REGION" \
+    --cluster-name "$CLUSTER_NAME" \
+    --nodegroup-name "$NODEGROUP_NAME" \
+    --query 'nodegroup.resources.autoScalingGroups[0].name' \
+    --output text \
+    --no-cli-pager)
+
+  if pod_identity_status=$(get_addon_status 'eks-pod-identity-agent'); then :; else pod_identity_status='NOT_INSTALLED'; fi
+  if cloudwatch_status=$(get_addon_status 'amazon-cloudwatch-observability'); then :; else cloudwatch_status='NOT_INSTALLED'; fi
+
+  cat <<EOF_SUMMARY
+
+========================================
+AMAZON EKS LISTO
+========================================
+Cuenta AWS:             $account_id
+Región:                 $REGION
+
+VPC:                    $vpc_id
+Subred APP A:           $subnet_a
+Subred APP B:           $subnet_b
+
+Clúster EKS:            $CLUSTER_NAME
+Estado clúster:         $cluster_status
+Versión Kubernetes:     $actual_version
+Endpoint:               $endpoint
+Security Group:         $cluster_sg
+
+Node Group:             $NODEGROUP_NAME
+Estado Node Group:      $nodegroup_status
+Tipo de instancia:      $NODE_INSTANCE_TYPE
+Escalamiento:           $NODE_MIN_SIZE/$NODE_DESIRED_SIZE/$NODE_MAX_SIZE
+Auto Scaling Group:     $nodegroup_asg
+
+Observabilidad:
+  Control Plane Logs:   ENABLED
+  Pod Identity Agent:   $pod_identity_status
+  CloudWatch Add-on:    $cloudwatch_status
+
+Repositorios ECR:
+EOF_SUMMARY
+
+  for repository in "${ECR_REPOSITORIES[@]}"; do
+    printf '  %s.dkr.ecr.%s.amazonaws.com/%s\n' "$account_id" "$REGION" "$repository"
+  done
+
+  cat <<EOF_COMMANDS
+
+Comandos de verificación:
+  aws eks describe-cluster --region $REGION --name $CLUSTER_NAME
+  kubectl get nodes
+  kubectl get pods --all-namespaces
+  kubectl get addons 2>/dev/null || true
+========================================
+EOF_COMMANDS
+}
+
+#######################################
+# MAIN
+#######################################
+main() {
+  local account_id identity_arn
+  local vpc_id subnet_a subnet_b subnet_a_az subnet_b_az
+  local cluster_role_arn node_role_arn
+
+  print_header
+
+  log_info "0. Validando herramientas, variables y credenciales..."
+  validate_inputs
+
+  read -r account_id identity_arn < <(aws sts get-caller-identity \
+    --query '[Account,Arn]' \
+    --output text \
+    --no-cli-pager)
+
+  is_empty_aws_value "$account_id" && fail "No fue posible identificar la cuenta AWS."
+  log_ok "Credenciales válidas. Cuenta: $account_id"
+  log_ok "Identidad: $identity_arn"
+
+  log_info "1. Descubriendo VPC y subredes privadas APP..."
+  vpc_id=$(find_vpc)
+  subnet_a=$(find_subnet "$vpc_id" "${NETWORK_PROJECT_NAME}-app-a")
+  subnet_b=$(find_subnet "$vpc_id" "${NETWORK_PROJECT_NAME}-app-b")
+
+  subnet_a_az=$(validate_private_subnet "$subnet_a")
+  subnet_b_az=$(validate_private_subnet "$subnet_b" "$subnet_a_az")
+
+  log_ok "VPC: $vpc_id"
+  log_ok "Subred APP A: $subnet_a ($subnet_a_az)"
+  log_ok "Subred APP B: $subnet_b ($subnet_b_az)"
+
+  log_info "2. Validando rutas privadas y NAT Gateway..."
+  validate_nat_route "$vpc_id" "$subnet_a"
+  validate_nat_route "$vpc_id" "$subnet_b"
+
+  log_info "3. Descubriendo roles IAM existentes de AWS Academy..."
+  cluster_role_arn=$(resolve_role_arn "$EKS_CLUSTER_ROLE_ARN" "$EKS_CLUSTER_ROLE_NAME")
+  node_role_arn=$(resolve_role_arn "$EKS_NODE_ROLE_ARN" "$EKS_NODE_ROLE_NAME")
+
+  validate_role_trust "$cluster_role_arn" 'eks.amazonaws.com'
+  validate_role_trust "$node_role_arn" 'ec2.amazonaws.com'
+  log_ok "Rol del clúster: $cluster_role_arn"
+  log_ok "Rol de los nodos: $node_role_arn"
+
+  log_info "4. Asegurando repositorios Amazon ECR..."
+  ensure_ecr_repositories
+
+  log_info "5. Asegurando clúster Amazon EKS..."
+  ensure_cluster "$cluster_role_arn" "$subnet_a" "$subnet_b"
+
+  log_info "6. Asegurando logs del plano de control..."
+  ensure_control_plane_logs
+
+  log_info "7. Configurando kubeconfig..."
+  configure_kubeconfig
+
+  log_info "8. Asegurando Managed Node Group..."
+  ensure_nodegroup "$node_role_arn" "$subnet_a" "$subnet_b"
+
+  log_info "9. Verificando nodos Kubernetes..."
+  verify_kubernetes
+
+  log_info "10. Configurando add-ons y observabilidad..."
+  ensure_cloudwatch_observability
+
+  log_info "11. Resumen final..."
+  print_summary "$account_id" "$vpc_id" "$subnet_a" "$subnet_b"
+}
+
+main "$@"
