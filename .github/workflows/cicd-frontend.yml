@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REGION: us-east-1
   EKS_CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
   ECR_REPOSITORY: tienda-frontend
   KUBERNETES_NAMESPACE: tienda
