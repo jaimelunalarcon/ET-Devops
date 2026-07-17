@@ -27,13 +27,28 @@ env:
 
 jobs:
   build-push-deploy:
-    name: Build, Push and Deploy Backend
+    name: Test, Build, Push and Deploy Backend
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Configure Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run Backend automated tests
+        working-directory: backend
+        run: npm test
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
