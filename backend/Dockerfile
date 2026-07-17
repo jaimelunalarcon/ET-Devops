@@ -2,11 +2,11 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json package-lock.json ./
 
-RUN npm install --production
+RUN npm ci --omit=dev
 
-COPY . .
+COPY server.js ./
 
 EXPOSE 3001
 

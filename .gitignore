@@ -1,6 +1,11 @@
-.DS_Store
 node_modules/
 .env
 *.log
 *.zip
+
+# Kubernetes
 k8s/11-secret.yaml
+
+# macOS
+.DS_Store
+**/.DS_Store

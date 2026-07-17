@@ -1,0 +1,125 @@
+name: CI/CD - Backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/cicd-backend.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cicd-backend-production
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+  ECR_REPOSITORY: tienda-backend
+  KUBERNETES_NAMESPACE: tienda
+  DEPLOYMENT_NAME: tienda-backend
+  CONTAINER_NAME: tienda-backend
+
+jobs:
+  build-push-deploy:
+    name: Build, Push and Deploy Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Backend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+          echo "Construyendo imagen: ${IMAGE_URI}:${IMAGE_TAG}"
+
+          docker build \
+            --file backend/Dockerfile \
+            --tag "${IMAGE_URI}:${IMAGE_TAG}" \
+            --tag "${IMAGE_URI}:latest" \
+            backend
+
+          docker push "${IMAGE_URI}:${IMAGE_TAG}"
+          docker push "${IMAGE_URI}:latest"
+
+          echo "IMAGE_URI=${IMAGE_URI}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Update EKS kubeconfig
+        run: |
+          set -euo pipefail
+
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}"
+
+          kubectl config current-context
+          kubectl get nodes
+
+      - name: Deploy Backend image
+        run: |
+          set -euo pipefail
+
+          kubectl set image \
+            deployment/${DEPLOYMENT_NAME} \
+            ${CONTAINER_NAME}="${IMAGE_URI}" \
+            --namespace "${KUBERNETES_NAMESPACE}"
+
+      - name: Wait for Backend rollout
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status \
+            deployment/${DEPLOYMENT_NAME} \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --timeout=300s
+
+      - name: Verify Backend deployment
+        run: |
+          set -euo pipefail
+
+          echo "Deployment:"
+          kubectl get deployment "${DEPLOYMENT_NAME}" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --output wide
+
+          echo "Pods:"
+          kubectl get pods \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --selector app=tienda-backend \
+            --output wide
+
+          echo "HPA:"
+          kubectl get hpa tienda-backend-hpa \
+            --namespace "${KUBERNETES_NAMESPACE}"
+
+          echo "Imagen desplegada:"
+          kubectl get deployment "${DEPLOYMENT_NAME}" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --output=jsonpath='{.spec.template.spec.containers[*].image}'
+
+          echo

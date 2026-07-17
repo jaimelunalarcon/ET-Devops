@@ -10,7 +10,6 @@ metadata:
 
 spec:
   replicas: 2
-
   revisionHistoryLimit: 5
 
   strategy:
@@ -88,22 +87,27 @@ spec:
                   key: MYSQL_PASSWORD
 
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /api/health
               port: http
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 12
 
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /api/ready
               port: http
+            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
 
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /api/health
               port: http
+            initialDelaySeconds: 10
             periodSeconds: 20
             timeoutSeconds: 2
             failureThreshold: 3
@@ -112,7 +116,6 @@ spec:
             requests:
               cpu: "100m"
               memory: "128Mi"
-
             limits:
               cpu: "500m"
               memory: "512Mi"
